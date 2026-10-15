@@ -1,0 +1,57 @@
+{
+  "captured_at_utc": "2026-10-15T15:31:25Z",
+  "failures": [],
+  "probe_script": "tools/probe/probe_control_mode.py",
+  "probes": {
+    "attach_and_commands": {
+      "00_attach_burst": "attach_and_commands.00_attach_burst.bin",
+      "01_cmd_display_message": "attach_and_commands.01_cmd_display_message.bin",
+      "02_cmd_list_windows": "attach_and_commands.02_cmd_list_windows.bin",
+      "03_cmd_error": "attach_and_commands.03_cmd_error.bin",
+      "04_cmd_list_panes": "attach_and_commands.04_cmd_list_panes.bin",
+      "05_cmd_list_sessions": "attach_and_commands.05_cmd_list_sessions.bin",
+      "06_cmd_show_options": "attach_and_commands.06_cmd_show_options.bin",
+      "07_cmd_binary_output": "attach_and_commands.07_cmd_binary_output.bin",
+      "08_cmd_wide_output": "attach_and_commands.08_cmd_wide_output.bin",
+      "09_capture_plain": "attach_and_commands.09_capture_plain.bin",
+      "10_capture_styled": "attach_and_commands.10_capture_styled.bin",
+      "11_capture_meta": "attach_and_commands.11_capture_meta.bin",
+      "12_percent_inside_block": "attach_and_commands.12_percent_inside_block.bin",
+      "13_exit_burst": "attach_and_commands.13_exit_burst.bin",
+      "14_after_exit": "attach_and_commands.14_after_exit.bin",
+      "15_client_stderr": "attach_and_commands.15_client_stderr.bin"
+    },
+    "cc_entry": {
+      "00_cc_prologue": "cc_entry.00_cc_prologue.bin",
+      "01_cc_command": "cc_entry.01_cc_command.bin",
+      "02_cc_exit": "cc_entry.02_cc_exit.bin",
+      "03_cc_after_exit": "cc_entry.03_cc_after_exit.bin"
+    },
+    "notifications": {
+      "00_attach_burst": "notifications.00_attach_burst.bin",
+      "01_new_window": "notifications.01_new_window.bin",
+      "02_rename_window": "notifications.02_rename_window.bin",
+      "03_split_window": "notifications.03_split_window.bin",
+      "04_split_window_vertical": "notifications.04_split_window_vertical.bin",
+      "05_select_pane": "notifications.05_select_pane.bin",
+      "06_resize_pane": "notifications.06_resize_pane.bin",
+      "07_layout_odd": "notifications.07_layout_odd.bin",
+      "08_new_session": "notifications.08_new_session.bin",
+      "09_kill_window": "notifications.09_kill_window.bin",
+      "10_kill_session": "notifications.10_kill_session.bin",
+      "11_window_name_special": "notifications.11_window_name_special.bin",
+      "12_format_special": "notifications.12_format_special.bin",
+      "13_enter_copy_mode": "notifications.13_enter_copy_mode.bin",
+      "14_leave_copy_mode": "notifications.14_leave_copy_mode.bin",
+      "15_layout_string": "notifications.15_layout_string.bin",
+      "16_exit": "notifications.16_exit.bin"
+    },
+    "plain_shell_leak": {
+      "00_prologue": "plain_shell_leak.00_prologue.bin",
+      "01_detach": "plain_shell_leak.01_detach.bin",
+      "02_pane_after": "plain_shell_leak.02_pane_after.bin"
+    }
+  },
+  "python": "3.12.3",
+  "tmux_version": "tmux 3.4"
+}

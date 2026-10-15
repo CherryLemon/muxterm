@@ -1,0 +1,19 @@
+[package]
+name = "poc-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Headless proof-of-concept driver for the tmux control-mode stack"
+
+[[bin]]
+name = "poc"
+path = "src/main.rs"
+
+[dependencies]
+tmux-protocol = { workspace = true }
+tmux-client = { workspace = true }
+term-core = { workspace = true }
+# Cross-platform PTY abstraction.  Used only by the takeover (leak) scenario, which
+# must own a real terminal to prove that no control command reaches the shell.
+portable-pty = "0.8"

@@ -1,0 +1,12 @@
+[package]
+name = "term-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Terminal emulation boundary: read-only screen export, snapshot restore, side-effect isolation"
+
+[dependencies]
+# Candidate terminal core, adopted behind the boundary in src/lib.rs once the
+# capability gate in docs/adr/0002 passed.  See docs/adr/0004-terminal-core-choice.md.
+alacritty_terminal = "0.26"

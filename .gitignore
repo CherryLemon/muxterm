@@ -1,0 +1,13 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Local toolchain installed inside the workspace (never committed)
+/.toolchain
+
+# Container/CI leftovers
+*.tar
+*.tar.gz
+/crates/*/tests/fixtures/tmp-*
+# Sandbox fallback rootfs (see docs/dev-environment.md)
+/.sandbox

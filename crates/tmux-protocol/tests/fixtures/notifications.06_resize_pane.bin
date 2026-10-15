@@ -1,0 +1,4 @@
+%layout-change @1 c824,80x24,0,0{45x24,0,0,1,34x24,46,0[34x12,46,0,2,34x11,46,13,3]} c824,80x24,0,0{45x24,0,0,1,34x24,46,0[34x12,46,0,2,34x11,46,13,3]} *
+%output %1 \015\033[K\015root@muxterm-test:/work# 
+%output %2 \015\033[K\015root@muxterm-test:/work# 
+%output %3 \015\033[K\015root@muxterm-test:/work# 

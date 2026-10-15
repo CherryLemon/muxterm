@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# Docker runner (used by tools/container/run.sh when the daemon is healthy).
+#
+# Why a named volume instead of a bind mount: the repository lives on a network
+# filesystem that does not propagate into the container's mount namespace, so
+# `-v "$ROOT":/work` yields an empty directory.  The volume below is the meeting
+# point instead:
+#
+#   1. sources are streamed into the volume (excluding build artefacts)
+#   2. the command runs against the volume, with /tmp as a private tmpfs - so any
+#      tmux server, socket or PTY it creates lives and dies with the container and
+#      can never attach to the developer's own tmux
+#   3. generated files are streamed back into the repository
+#
+# Isolation that remains: separate PID/mount/UTS/IPC namespaces, private /tmp,
+# private tmux socket directory, no host process reachable.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+IMAGE="${MUXTERM_TEST_IMAGE:-muxterm-test:latest}"
+WORK_VOLUME="${MUXTERM_WORK_VOLUME:-muxterm-work}"
+TARGET_VOLUME="${MUXTERM_TARGET_VOLUME:-muxterm-target}"
+REGISTRY_VOLUME="${MUXTERM_REGISTRY_VOLUME:-muxterm-cargo-registry}"
+GIT_VOLUME="${MUXTERM_GIT_VOLUME:-muxterm-cargo-git}"
+
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  echo "image $IMAGE not found; building it first" >&2
+  "$ROOT/tools/container/build-image.sh" >&2
+fi
+
+for volume in "$WORK_VOLUME" "$TARGET_VOLUME" "$REGISTRY_VOLUME" "$GIT_VOLUME"; do
+  docker volume inspect "$volume" >/dev/null 2>&1 || docker volume create "$volume" >/dev/null
+done
+
+# 1. sources in, as an exact mirror.  The volume keeps its own target/ (its own
+#    volume, mounted separately), so the source tree is cleared first - otherwise a
+#    file deleted on the host would survive in the volume and keep being compiled.
+tar -C "$ROOT" \
+    --exclude=./target \
+    --exclude=./.sandbox \
+    --exclude=./.toolchain \
+    --exclude=./.git \
+    -cf - . \
+  | docker run --rm -i -v "$WORK_VOLUME":/work --entrypoint sh "$IMAGE" -c \
+      'rm -rf /work/crates /work/tools /work/docs /work/docker /work/Cargo.toml /work/Cargo.lock /work/*.md; tar -C /work -xf -' 
+
+interactive=()
+if [ -t 0 ] && [ -t 1 ]; then
+  interactive=(-t)
+fi
+
+# The cargo registry and, on this network, the HTTP proxy live on the host's
+# loopback interface, so the container shares the host network namespace by
+# default.  Everything else stays isolated.  MUXTERM_NETWORK=bridge opts out.
+network_args=(--network host)
+if [ "${MUXTERM_NETWORK:-host}" = "bridge" ]; then
+  network_args=()
+fi
+
+proxy_env=()
+if [ "${MUXTERM_NETWORK:-host}" != "bridge" ]; then
+  for var in http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY; do
+    value="${!var:-}"
+    [ -n "$value" ] && proxy_env+=(-e "$var=$value")
+  done
+fi
+
+# 2. run
+status=0
+docker run --rm -i "${interactive[@]}" \
+  --init \
+  --hostname muxterm-test \
+  "${network_args[@]}" \
+  "${proxy_env[@]}" \
+  --tmpfs /tmp:rw,mode=1777,exec \
+  --tmpfs /tmp/tmux-runtime:rw,mode=700,uid=0,gid=0 \
+  -v "$WORK_VOLUME":/work \
+  -w /work \
+  -v "$TARGET_VOLUME":/work/target \
+  -v "$REGISTRY_VOLUME":/root/.cargo/registry \
+  -v "$GIT_VOLUME":/root/.cargo/git \
+  -e CARGO_TERM_COLOR=always \
+  -e RUST_BACKTRACE=1 \
+  -e MUXTERM_IN_CONTAINER=1 \
+  "$IMAGE" "$@" || status=$?
+
+# 3. generated files out.  Only recorded artefacts travel back: sources flow one
+#    way (host -> container) so a container run can never clobber an edit.
+sync_back_paths=(crates/tmux-protocol/tests/fixtures)
+# MUXTERM_SYNC_BACK_EXTRA lets a one-off run (for example `cargo fmt`) write more
+# paths back; it is deliberately not the default, so a normal run can never
+# clobber an edit made while it was executing.
+if [ -n "${MUXTERM_SYNC_BACK_EXTRA:-}" ]; then
+  IFS=':' read -r -a extra <<<"$MUXTERM_SYNC_BACK_EXTRA"
+  sync_back_paths+=("${extra[@]}")
+fi
+existing=()
+for path in "${sync_back_paths[@]}"; do
+  if docker run --rm -v "$WORK_VOLUME":/work --entrypoint test "$IMAGE" -e "/work/$path"; then
+    existing+=("$path")
+  fi
+done
+if [ "${#existing[@]}" -gt 0 ]; then
+  docker run --rm -v "$WORK_VOLUME":/work --entrypoint tar "$IMAGE" \
+      -C /work -cf - "${existing[@]}" \
+    | tar -C "$ROOT" -xf -
+fi
+
+exit $status

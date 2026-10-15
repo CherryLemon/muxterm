@@ -1,0 +1,17 @@
+[package]
+name = "tmux-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Clean-room tmux control-mode protocol: byte-level parser, command encoder and scheduler"
+
+# Deliberately dependency-free: this crate must stay usable in replay tests,
+# property tests and fuzzers without pulling a runtime, a network stack or a GUI.
+[dependencies]
+
+[dev-dependencies]
+
+[[test]]
+name = "fixtures"
+path = "tests/fixtures.rs"

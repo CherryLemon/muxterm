@@ -1,0 +1,5 @@
+# Normalise text to LF; never touch the recorded protocol captures, which are
+# byte-exact evidence and must survive a clone unchanged.
+* text=auto eol=lf
+*.bin binary
+*.tar.gz binary

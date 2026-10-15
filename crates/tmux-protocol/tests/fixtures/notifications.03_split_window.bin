@@ -1,0 +1,5 @@
+%window-pane-changed @1 %2
+%layout-change @1 020a,80x24,0,0{40x24,0,0,1,39x24,41,0,2} 020a,80x24,0,0{40x24,0,0,1,39x24,41,0,2} *
+%output %1 \015\033[K\015root@muxterm-test:/work# 
+%output %2 \033[?2004h
+%output %2 root@muxterm-test:/work# 

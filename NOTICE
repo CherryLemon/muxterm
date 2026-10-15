@@ -1,0 +1,8 @@
+Muxterm is an independent implementation of a tmux-compatible terminal client.
+
+It contains no iTerm2 source code, resources or derived design documents;
+compatibility work is based on public protocols, our own specifications and
+recorded black-box observations.  See docs/clean-room.md.
+
+Third-party components keep their own licences; the dependency policy and the
+reviewed list are in docs/licences.md.

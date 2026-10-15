@@ -1,0 +1,3 @@
+%begin 1792078287 279 1
+parse error: unknown command: definitely-not-a-command
+%error 1792078287 279 1
