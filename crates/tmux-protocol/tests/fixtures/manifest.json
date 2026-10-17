@@ -1,5 +1,5 @@
 {
-  "captured_at_utc": "2026-10-15T15:31:25Z",
+  "captured_at_utc": "2026-10-17T21:26:09Z",
   "failures": [],
   "probe_script": "tools/probe/probe_control_mode.py",
   "probes": {

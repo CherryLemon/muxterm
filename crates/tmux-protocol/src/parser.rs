@@ -329,6 +329,11 @@ pub struct Parser {
     state: State,
     response_bytes: u64,
     response_lines: u32,
+    /// Body bytes discarded after a response limit was hit.
+    skipped_bytes: u64,
+    /// True when [`State::Skipping`] was entered because a response limit was
+    /// hit, so a [`Desync::ResponseTooLarge`] is owed when the block closes.
+    skip_truncated: bool,
     dropped_bytes: u64,
     /// Set once `%exit` has been seen; the stream must not be trusted afterwards.
     exited: bool,
@@ -345,6 +350,8 @@ impl Parser {
             state: State::Outside,
             response_bytes: 0,
             response_lines: 0,
+            skipped_bytes: 0,
+            skip_truncated: false,
             dropped_bytes: 0,
             exited: false,
         }
@@ -433,40 +440,62 @@ impl Parser {
             return;
         }
         let dropped = self.buffered_bytes() as u64;
-        self.dropped_bytes += dropped;
+        self.dropped_bytes = self.dropped_bytes.saturating_add(dropped);
         self.buf.clear();
         self.scan = 0;
-        // Inside a response block we must drop the whole block, not just the line:
-        // its framing is no longer trustworthy.
-        self.state = match self.state {
-            State::InResponse(header) | State::Skipping(header) => State::Skipping(header),
-            _ => State::SkipLine,
-        };
-        sink.event(Event::Desync {
-            reason: Desync::LineTooLong,
-            dropped_bytes: dropped,
-        });
+        match self.state {
+            // The line was already reported when its first over-long chunk was
+            // seen; swallow the rest without a second report.
+            State::SkipLine => {}
+            State::Skipping(header) => {
+                // The block is already lost, but its dropped bytes still count
+                // towards the recovery bound.
+                self.account_skipped(header, dropped, sink);
+            }
+            State::InResponse(header) => {
+                // Inside a response block we must drop the whole block, not just
+                // the line: its framing is no longer trustworthy.
+                self.begin_skipping(header, false);
+                sink.event(Event::Desync {
+                    reason: Desync::LineTooLong,
+                    dropped_bytes: dropped,
+                });
+                self.account_skipped(header, dropped, sink);
+            }
+            State::Outside => {
+                self.state = State::SkipLine;
+                sink.event(Event::Desync {
+                    reason: Desync::LineTooLong,
+                    dropped_bytes: dropped,
+                });
+            }
+        }
     }
 
     fn handle_line(&mut self, line: &[u8], sink: &mut impl EventSink) {
+        if matches!(self.state, State::SkipLine) {
+            // Tail of an over-long line that was already reported; resynchronise
+            // here and do not count it as a second line.
+            self.state = State::Outside;
+            self.dropped_bytes = self.dropped_bytes.saturating_add(line.len() as u64);
+            return;
+        }
+        if line.len() > self.limits.max_line_bytes {
+            self.report_line_too_long(line, sink);
+            return;
+        }
         match self.state {
-            State::SkipLine => {
-                self.state = State::Outside;
-                self.dropped_bytes += line.len() as u64;
-            }
+            // Already handled by the branch above.
+            State::SkipLine => {}
             State::Skipping(header) => {
-                self.dropped_bytes += line.len() as u64;
+                self.dropped_bytes = self.dropped_bytes.saturating_add(line.len() as u64);
                 if let Some((is_error, parsed)) = parse_frame_end(line) {
                     if parsed.number == header.number {
-                        self.state = State::Outside;
-                        self.reset_response_counters();
-                        sink.event(if is_error {
-                            Event::ResponseError(header)
-                        } else {
-                            Event::ResponseEnd(header)
-                        });
+                        self.finish_skipping(header, is_error, sink);
+                        return;
                     }
                 }
+                self.account_skipped(header, line.len() as u64 + 1, sink);
             }
             State::InResponse(header) => {
                 if let Some((is_error, parsed)) = parse_frame_end(line) {
@@ -488,19 +517,86 @@ impl Parser {
                 if self.response_bytes > self.limits.max_response_bytes
                     || self.response_lines > self.limits.max_response_lines
                 {
-                    let dropped = self.response_bytes;
-                    self.dropped_bytes += dropped;
-                    self.state = State::Skipping(header);
-                    sink.event(Event::Desync {
-                        reason: Desync::ResponseTooLarge,
-                        dropped_bytes: dropped,
-                    });
+                    // The line that broke the limit is not delivered: it is the
+                    // first byte of the discarded body.  The truthful dropped
+                    // count is reported once the block closes (or when skipping
+                    // itself becomes too large).
+                    self.begin_skipping(header, true);
+                    self.account_skipped(header, line.len() as u64 + 1, sink);
                     return;
                 }
                 sink.event(Event::ResponseLine(line.to_vec()));
             }
             State::Outside => self.handle_notification(line, sink),
         }
+    }
+
+    /// Reports and discards one complete, over-long line.
+    fn report_line_too_long(&mut self, line: &[u8], sink: &mut impl EventSink) {
+        let dropped = line.len() as u64;
+        self.dropped_bytes = self.dropped_bytes.saturating_add(dropped);
+        sink.event(Event::Desync {
+            reason: Desync::LineTooLong,
+            dropped_bytes: dropped,
+        });
+        match self.state {
+            State::InResponse(header) => {
+                // The block content is no longer reliable: drop the rest of it.
+                self.begin_skipping(header, false);
+                self.account_skipped(header, dropped.saturating_add(1), sink);
+            }
+            State::Skipping(header) => {
+                self.account_skipped(header, dropped.saturating_add(1), sink);
+            }
+            _ => self.state = State::Outside,
+        }
+    }
+
+    fn begin_skipping(&mut self, header: ResponseHeader, truncated: bool) {
+        self.state = State::Skipping(header);
+        self.skipped_bytes = 0;
+        self.skip_truncated = truncated;
+    }
+
+    /// Counts body bytes discarded while skipping and bounds the recovery.
+    fn account_skipped(&mut self, header: ResponseHeader, bytes: u64, sink: &mut impl EventSink) {
+        self.skipped_bytes = self.skipped_bytes.saturating_add(bytes);
+        if self.skipped_bytes > self.limits.max_response_bytes {
+            let dropped = std::mem::take(&mut self.skipped_bytes);
+            self.skip_truncated = false;
+            self.state = State::Outside;
+            self.reset_response_counters();
+            sink.event(Event::Desync {
+                reason: Desync::ResponseTooLarge,
+                dropped_bytes: dropped,
+            });
+            // Settle the request: without an `%end` the queue would wait forever.
+            sink.event(Event::ResponseError(header));
+        }
+    }
+
+    fn finish_skipping(
+        &mut self,
+        header: ResponseHeader,
+        is_error: bool,
+        sink: &mut impl EventSink,
+    ) {
+        self.state = State::Outside;
+        let dropped = std::mem::take(&mut self.skipped_bytes);
+        let truncated = self.skip_truncated;
+        self.skip_truncated = false;
+        self.reset_response_counters();
+        if truncated {
+            sink.event(Event::Desync {
+                reason: Desync::ResponseTooLarge,
+                dropped_bytes: dropped,
+            });
+        }
+        sink.event(if is_error {
+            Event::ResponseError(header)
+        } else {
+            Event::ResponseEnd(header)
+        });
     }
 
     fn end_block_with_desync(
@@ -523,6 +619,8 @@ impl Parser {
     fn reset_response_counters(&mut self) {
         self.response_bytes = 0;
         self.response_lines = 0;
+        self.skipped_bytes = 0;
+        self.skip_truncated = false;
     }
 
     fn handle_notification(&mut self, line: &[u8], sink: &mut impl EventSink) {
@@ -536,8 +634,7 @@ impl Parser {
         match verb {
             b"%begin" => match parse_header(rest) {
                 Some(header) => {
-                    self.response_bytes = 0;
-                    self.response_lines = 0;
+                    self.reset_response_counters();
                     self.state = State::InResponse(header);
                     sink.event(Event::ResponseBegin(header));
                 }
@@ -1088,6 +1185,131 @@ mod tests {
     }
 
     #[test]
+    fn complete_overlong_line_is_rejected_in_one_shot() {
+        let limits = Limits {
+            max_line_bytes: 32,
+            ..Limits::strict()
+        };
+        let mut parser = Parser::new(limits);
+        let mut events = Vec::new();
+        let mut input = vec![b'x'; 33];
+        input.push(b'\n');
+        input.extend_from_slice(b"%window-add @6\n");
+        parser.feed(&input, &mut events);
+        assert_eq!(
+            events[0],
+            Event::Desync {
+                reason: Desync::LineTooLong,
+                dropped_bytes: 33
+            },
+            "a complete over-long line must be rejected, not parsed"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Raw { .. } | Event::Unknown { .. })),
+            "the over-long line must not reach the notification parser"
+        );
+        assert!(events.contains(&Event::WindowAdd {
+            window: WindowId::new(6)
+        }));
+
+        // Exactly at the limit is still accepted.
+        events.clear();
+        let mut at_limit = vec![b'y'; 32];
+        at_limit.push(b'\n');
+        parser.feed(&at_limit, &mut events);
+        assert_eq!(
+            events,
+            vec![Event::Raw {
+                line: vec![b'y'; 32]
+            }]
+        );
+    }
+
+    #[test]
+    fn chunked_overlong_complete_line_is_reported_once_and_recovers() {
+        let limits = Limits {
+            max_line_bytes: 32,
+            ..Limits::strict()
+        };
+        let mut parser = Parser::new(limits);
+        let mut events = Vec::new();
+        let mut input = vec![b'x'; 200];
+        input.push(b'\n');
+        input.extend_from_slice(b"%window-add @7\n");
+        for chunk in input.chunks(16) {
+            parser.feed(chunk, &mut events);
+        }
+        let reports: Vec<u64> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Desync {
+                    reason: Desync::LineTooLong,
+                    dropped_bytes,
+                } => Some(*dropped_bytes),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reports.len(),
+            1,
+            "one logical over-long line must be reported once, got {reports:?}"
+        );
+        assert!(
+            events.contains(&Event::WindowAdd {
+                window: WindowId::new(7)
+            }),
+            "the parser must resynchronise after the newline"
+        );
+        assert_eq!(parser.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn overlong_line_inside_a_response_skips_the_block_but_closes_it() {
+        let limits = Limits {
+            max_line_bytes: 32,
+            ..Limits::strict()
+        };
+        let mut parser = Parser::new(limits);
+        let mut events = Vec::new();
+        let mut input = b"%begin 1 9 0\n".to_vec();
+        input.extend_from_slice(&[b'A'; 100]);
+        input.extend_from_slice(b"\nbody line\n%end 1 9 0\n%window-add @8\n");
+        parser.feed(&input, &mut events);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Desync {
+                reason: Desync::LineTooLong,
+                dropped_bytes: 100
+            }
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::ResponseLine(line) if line.len() == 100)),
+            "the over-long line is not a response line"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::ResponseLine(line) if line == b"body line")),
+            "the rest of the unreliable block is discarded"
+        );
+        assert!(
+            events.contains(&Event::ResponseEnd(ResponseHeader {
+                time: 1,
+                number: 9,
+                flags: 0
+            })),
+            "a matching %end must still settle the block"
+        );
+        assert!(events.contains(&Event::WindowAdd {
+            window: WindowId::new(8)
+        }));
+    }
+
+    #[test]
     fn oversized_response_is_truncated_and_closed() {
         let limits = Limits {
             max_response_lines: 2,
@@ -1115,6 +1337,79 @@ mod tests {
                 window: WindowId::new(8)
             }),
             "parsing resumes after resynchronisation"
+        );
+    }
+
+    #[test]
+    fn response_too_large_counts_only_discarded_body_bytes() {
+        let limits = Limits {
+            max_response_bytes: 8,
+            ..Limits::strict()
+        };
+        let mut parser = Parser::new(limits);
+        let mut events = Vec::new();
+        parser.feed(b"%begin 1 1 0\nkept\n0123456789\n%end 1 1 0\n", &mut events);
+        let dropped: Vec<u64> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Desync {
+                    reason: Desync::ResponseTooLarge,
+                    dropped_bytes,
+                } => Some(*dropped_bytes),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dropped,
+            vec![b"0123456789\n".len() as u64],
+            "only the body bytes discarded after the limit are counted, \
+             not the line that was already delivered"
+        );
+        assert!(events.contains(&Event::ResponseLine(b"kept".to_vec())));
+    }
+
+    #[test]
+    fn skipping_is_bounded_and_recovers() {
+        let limits = Limits {
+            max_response_lines: 1,
+            max_response_bytes: 16,
+            ..Limits::strict()
+        };
+        let mut parser = Parser::new(limits);
+        let mut events = Vec::new();
+        parser.feed(b"%begin 1 1 0\nfirst\n", &mut events);
+        assert!(events.contains(&Event::ResponseLine(b"first".to_vec())));
+        // Second line pushes the response over its byte limit and starts the skip.
+        parser.feed(b"0123456789\n", &mut events);
+        // Skipping another line exceeds the recovery bound.
+        parser.feed(b"0123456789\n", &mut events);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::Desync {
+                    reason: Desync::ResponseTooLarge,
+                    dropped_bytes: 22
+                }
+            )),
+            "the discarded suffix is accounted for and bounded"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::ResponseError(_))),
+            "the queue must be able to settle the abandoned block"
+        );
+        assert!(!parser.in_response());
+        assert_eq!(parser.buffered_bytes(), 0);
+
+        events.clear();
+        parser.feed(b"%window-add @9\n", &mut events);
+        assert_eq!(
+            events,
+            vec![Event::WindowAdd {
+                window: WindowId::new(9)
+            }],
+            "parsing resumes once the recovery bound is hit"
         );
     }
 
