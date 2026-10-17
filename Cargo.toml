@@ -10,7 +10,8 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+# alacritty_terminal 0.26 (edition 2024) requires Rust 1.85.
+rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/CherryLemon/muxterm"
 description = "Muxterm: a cross-platform terminal where tmux windows are tabs and panes are splits"
