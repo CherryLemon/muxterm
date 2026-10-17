@@ -1,6 +1,6 @@
 # Independent specification: the tmux control-mode protocol, as we implement it
 
-**Spec version:** `control-mode/0.1` (kept in step with
+**Spec version:** `control-mode/0.2` (kept in step with
 `tmux_protocol::SPEC_VERSION`).
 
 ## Provenance
@@ -79,6 +79,19 @@ and, outside those blocks, single-line notifications that always start with `%`.
   honest response to "I do not understand the stream" is to resynchronise.
 * **[observed]** `%sessions-changed` carries no payload, so it forces a resync
   instead of a local guess.
+* **[observed, tmux 3.4]** `%pane-mode-changed` is sent **without** a mode name on
+  both entering and leaving copy mode (fixtures
+  `notifications.13_enter_copy_mode.bin` / `14_leave_copy_mode.bin`). The absence
+  of a name therefore means "the mode changed", not "left the mode"; the model
+  toggles. Versions that add the name on enter still work with the same rule.
+* **[ours]** `%pause` / `%continue` are surfaced as
+  `SessionEvent::OutputPaused` / `OutputResumed`; the GUI answers a pause with
+  `set_pane_output(pane, Continue)` (encoded as `refresh-client -A '%<pane>:continue'`).
+  `%extended-output` is delivered as ordinary output; its age is informational and
+  only appears if a client enables `pause-after`, which we do not.
+* **[ours]** `%message`, `%config-error` and lines that are not `%`-prefixed at all
+  (`Event::Raw`) are surfaced instead of dropped. A raw line means the stream is not
+  control mode any more; it is exactly the signal a shell leak would produce.
 
 ## 3. `%output` escaping
 
@@ -132,7 +145,9 @@ with a client request:
   keeps its place in flight.
 
 The second rule is what makes the ordering irrelevant: it does not matter whether
-the server's own answers arrive before or after the client's first write.
+the server's own answers arrive before or after the client's first write. When a
+snapshot fails, the barrier is cleared explicitly: otherwise every later command
+would be held behind a response that will never arrive.
 
 ## 5. Resource limits **[ours]**
 
@@ -140,16 +155,33 @@ Untrusted input must not be able to grow a buffer without bound:
 
 | Limit | Default | Behaviour on breach |
 |---|---|---|
-| `max_line_bytes` | 1 MiB | drop the line, `Desync::LineTooLong`, resync at the next newline |
-| `max_response_bytes` | 32 MiB | drop the rest of the block, `Desync::ResponseTooLarge`, close the block with `%end` |
-| `max_response_lines` | 4096 | as above |
+| `max_line_bytes` | 1 MiB | drop the line (partial *or* complete), `Desync::LineTooLong`, resync at the next newline/block end |
+| `max_response_bytes` | 32 MiB | drop the rest of the block, `Desync::ResponseTooLarge`, close the block with `%end`; also bounds how long a `Skipping` state may last |
+| `max_response_lines` | 4096 | as above; also the budget for `capture-pane` (`max_response_lines - pane_height` history lines) |
 | `max_switch_buffer_bytes` | 64 KiB | release the buffered bytes to the terminal |
-| `max_encoded_command_bytes` | 1 MiB | refuse to encode |
+| `max_encoded_command_bytes` | 1 MiB | chunk `send-keys` runs; refuse a single item that cannot fit |
 | `max_in_flight_commands` | 1 | hold the command in the pending queue |
 | `max_pending_commands` | 4096 | refuse to schedule |
 
+A desync inside a response block marks that response `truncated`; the synchroniser
+turns a truncated *snapshot* response into a hard error rather than applying it.
 Desynchronisation is always reported, never silently repaired: the model is marked
 untrustworthy and the caller must resynchronise before presenting state as accurate.
+
+### 5.1 Flow control, client size and resynchronisation **[ours]**
+
+* `refresh-client -A '%<pane>:<on|off|pause|continue>'` is how a control client
+  answers `%pause`/`%continue` and can throttle a pane.
+* `refresh-client -C <width>x<height>` (or `@<window>:<width>x<height>`) announces
+  the control client's size. Without it tmux keeps sizing the window from the
+  default it gave the pipe, and the GUI cannot drive pane geometry.
+* `resync()` re-runs the snapshot sequence; `%sessions-changed` and a desync
+  request it automatically (bounded), and a pane discovered after the snapshot gets
+  its own capture. See [`state-sync.md`](state-sync.md) §4.1.
+* A session created with `new_with_takeover` routes a `-CC` byte stream through
+  the DCS switch, so the shell bytes before/after control mode become
+  `SessionEvent::TerminalOutput` and the queue is closed on `%exit` / exit of the
+  switch.
 
 ## 6. Layout strings
 
@@ -179,9 +211,10 @@ node   := W 'x' H ',' X ',' Y ( ',' pane | '[' node (',' node)* ']'
 
 ## 7. Open questions tracked here
 
-* Whether a raw newline can be embedded in a tmux command argument (needed for
-  multi-line `set-buffer`). Until a capture proves it, the encoder refuses
-  newlines instead of guessing — see [`encoding.md`](encoding.md).
-* Which tmux version first sends a mode name on `%pane-mode-changed`; the parser
-  accepts both forms.
+* Whether a raw newline can be embedded in a general tmux command argument (needed
+  for a single `set-buffer`). `send_keys` avoids the question for text input by
+  splitting literal text into `-l` runs and `Enter`; other command arguments still
+  refuse newlines instead of guessing — see [`encoding.md`](encoding.md).
+* Which tmux version first sends a mode name on `%pane-mode-changed`; 3.4 does not
+  (fixtures 13/14), and the parser accepts both forms.
 * Whether `%extended-output`'s age is in milliseconds on every supported version.

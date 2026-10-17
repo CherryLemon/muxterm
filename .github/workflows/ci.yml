@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: fmt, clippy, tests and PoC e2e
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install tmux and python (Ubuntu 24.04 ships tmux 3.4)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tmux python3
+      - run: tmux -V
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace --all-targets
+      - name: Build the headless driver
+        run: cargo build --locked -p poc-cli
+      - name: PoC end-to-end (real tmux, private socket)
+        env:
+          SOCKET: ci-${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          POC=./target/debug/poc
+          $POC doctor --socket "$SOCKET"
+          $POC create --socket "$SOCKET"
+          $POC snapshot --socket "$SOCKET"
+          $POC stream --socket "$SOCKET" --seconds 2
+          $POC resize --socket "$SOCKET"
+          $POC mouse --socket "$SOCKET"
+          $POC reconnect --socket "$SOCKET" --detach-seconds 2
+          $POC core-gate --socket "$SOCKET"
+          $POC leak --socket "$SOCKET"
+          if $POC leak --socket "$SOCKET" --inject-bug; then
+            echo "the leak detector missed an injected leak" >&2
+            exit 1
+          fi
+
+  msrv:
+    name: MSRV (Rust 1.85)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - run: cargo check --locked --workspace --all-targets
