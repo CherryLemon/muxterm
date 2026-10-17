@@ -16,10 +16,12 @@ use std::io::{Read, Write};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
+use term_core::input::{encode_mouse, Modifiers, MouseAction, MouseButton, MouseEvent};
+use term_core::Modes;
 use tmux_client::session::{ControlSession, SessionEvent};
 use tmux_client::sync::SyncStats;
 use tmux_client::transport::Target;
-use tmux_client::RemoteModel;
+use tmux_client::{ModelChange, RemoteModel};
 use tmux_protocol::ids::PaneId;
 use tmux_protocol::limits::Limits;
 use tmux_protocol::parser::Parser;
@@ -159,14 +161,25 @@ pub fn create_poc_session(tmux: &Tmux, session: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Absolute path of a helper script in this repository.
+///
+/// `CARGO_MANIFEST_DIR` is baked in at compile time, so the path is correct both
+/// inside the container (`/work/crates/poc-cli`) and in CI (the checkout path).
+/// The `poc` binary is a development driver; it is not installed.
+fn poc_tool(name: &str) -> String {
+    format!("{}/../../tools/poc/{name}", env!("CARGO_MANIFEST_DIR"))
+}
+
 /// The pane command that produces the rich content used by the core gate.
 ///
-/// The script lives in the repository (`tools/poc/rich-content.sh`), which is
-/// mounted at `/work` inside the sandbox, so nothing has to be quoted through a
-/// terminal.
+/// The script lives in the repository (`tools/poc/rich-content.sh`); its path is
+/// shell-quoted before it is typed into the pane.
 #[must_use]
-pub const fn rich_content_command() -> &'static str {
-    "sh /work/tools/poc/rich-content.sh"
+pub fn rich_content_command() -> String {
+    format!(
+        "sh {}",
+        tmux_client::shell_quote(&poc_tool("rich-content.sh"))
+    )
 }
 
 /// Runs the rich-content script in a pane and waits until it has finished.
@@ -179,7 +192,7 @@ pub const fn rich_content_command() -> &'static str {
 /// Returns a description when the pane never reaches the marker.
 pub fn prepare_rich_content(tmux: &Tmux, session: &str, pane: &str) -> Result<(), String> {
     let target = format!("{session}:0.{pane}");
-    tmux.run(&["send-keys", "-t", &target, rich_content_command(), "Enter"])
+    tmux.run(&["send-keys", "-t", &target, &rich_content_command(), "Enter"])
         .map_err(|err| err.to_string())?;
 
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -502,6 +515,245 @@ fn drain_ticks(
         }
     }
     Ok(last)
+}
+
+/// Announces a new client size and checks that tmux and the model agree.
+///
+/// This is the screen-refresh half of the PoC: a control client that never sends
+/// `refresh-client -C` leaves tmux sizing the window from whatever default it
+/// gave the pipe, and the GUI can never drive pane geometry.
+///
+/// # Errors
+///
+/// Returns a description when the session or the tmux queries fail.
+pub fn resize(tmux: &Tmux, session: &str) -> Result<Report, String> {
+    let mut report = Report::default();
+    let mut control = attach(tmux, session)?;
+    let _ = control
+        .pump_until_synced(Duration::from_secs(20))
+        .map_err(|err| err.to_string())?;
+
+    let before: BTreeMap<PaneId, (u32, u32)> = control
+        .model()
+        .panes()
+        .iter()
+        .map(|(pane, state)| (*pane, (state.width, state.height)))
+        .collect();
+    report.check(
+        "the snapshot contains panes to resize",
+        !before.is_empty(),
+        format!("{} panes", before.len()),
+    );
+
+    // Attaching the control client may already have resized the window (tmux uses
+    // the client size, not the detached `new-session -x/-y`).  Pick a target that
+    // differs from the current one so the scenario is repeatable.
+    let current = tmux
+        .run(&[
+            "display-message",
+            "-p",
+            "-t",
+            &format!("{session}:0"),
+            "#{window_width}x#{window_height}",
+        ])
+        .map_err(|err| err.to_string())?;
+    let (target_columns, target_rows) = if current.trim() == "120x40" {
+        (100, 30)
+    } else {
+        (120, 40)
+    };
+    control
+        .resize_client(target_columns, target_rows)
+        .map_err(|err| err.to_string())?;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut resize_event = false;
+    while Instant::now() < deadline && !resize_event {
+        for event in control
+            .pump(Duration::from_millis(200))
+            .map_err(|err| err.to_string())?
+        {
+            if matches!(event, SessionEvent::Model(ModelChange::PaneResized { .. })) {
+                resize_event = true;
+            }
+        }
+    }
+
+    let after: BTreeMap<PaneId, (u32, u32)> = control
+        .model()
+        .panes()
+        .iter()
+        .map(|(pane, state)| (*pane, (state.width, state.height)))
+        .collect();
+    let changed = before
+        .iter()
+        .filter(|(pane, size)| after.get(pane).is_some_and(|new| new != *size))
+        .count();
+
+    let sizes = tmux
+        .run(&[
+            "display-message",
+            "-p",
+            "-t",
+            &format!("{session}:0"),
+            "#{window_width}x#{window_height}",
+        ])
+        .map_err(|err| err.to_string())?;
+    report.check(
+        "tmux accepted the announced client size",
+        sizes.trim() == format!("{target_columns}x{target_rows}"),
+        format!(
+            "before={}, after={}, announced={target_columns}x{target_rows}",
+            current.trim(),
+            sizes.trim()
+        ),
+    );
+    report.check(
+        "the resize reached the model",
+        resize_event && changed > 0,
+        format!(
+            "resize event={resize_event}, {changed} of {} panes changed geometry",
+            before.len()
+        ),
+    );
+
+    control.close();
+    Ok(report)
+}
+
+/// Sends encoded mouse reports to a real pane application and reads them back.
+///
+/// The pane runs `tools/poc/mouse-probe.py`, which enables SGR mouse reporting
+/// and copies every received byte into a file.  The scenario sends the output of
+/// `term_core::input::encode_mouse` through `send-keys -H` and compares the file
+/// with the expected bytes, so the check covers the encoder, the command
+/// encoder, tmux and the pane pty.
+///
+/// # Errors
+///
+/// Returns a description when the probe session or the tmux queries fail.
+pub fn mouse(tmux: &Tmux, session: &str) -> Result<Report, String> {
+    let mut report = Report::default();
+    let probe_session = format!("{session}-mouse");
+    let probe_file = format!("/tmp/muxterm-mouse-{}.bin", std::process::id());
+    let _ = std::fs::remove_file(&probe_file);
+    tmux.run_ignoring_errors(&["kill-session", "-t", &probe_session]);
+
+    let command = format!(
+        "stty -echo; python3 {} {}",
+        tmux_client::shell_quote(&poc_tool("mouse-probe.py")),
+        tmux_client::shell_quote(&probe_file)
+    );
+    tmux.run(&[
+        "new-session",
+        "-d",
+        "-s",
+        &probe_session,
+        "-x",
+        "80",
+        "-y",
+        "24",
+        &command,
+    ])
+    .map_err(|err| err.to_string())?;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !std::path::Path::new(&probe_file).exists() {
+        if Instant::now() > deadline {
+            tmux.run_ignoring_errors(&["kill-session", "-t", &probe_session]);
+            return Err(format!("the mouse probe never created {probe_file}"));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let mut control = attach(tmux, &probe_session)?;
+    let _ = control
+        .pump_until_synced(Duration::from_secs(20))
+        .map_err(|err| err.to_string())?;
+    // `list-panes -a` in the snapshot lists every pane on the server, so pick
+    // the probe session's pane explicitly instead of taking the first id.
+    let probe_panes = tmux
+        .run(&["list-panes", "-t", &probe_session, "-F", "#{pane_id}"])
+        .map_err(|err| err.to_string())?;
+    let Some(pane) = probe_panes
+        .lines()
+        .find_map(|line| PaneId::from_wire(line.trim().as_bytes()))
+    else {
+        return Err("the probe session has no pane".to_string());
+    };
+    if !control.model().panes().contains_key(&pane) {
+        return Err(format!("the probe pane {pane} is missing from the model"));
+    }
+
+    let modes = Modes {
+        mouse_click: true,
+        mouse_sgr: true,
+        mouse_reporting: true,
+        ..Modes::default()
+    };
+    let press = MouseEvent {
+        column: 10,
+        row: 5,
+        button: MouseButton::Left,
+        action: MouseAction::Press,
+        modifiers: Modifiers::default(),
+    };
+    let wheel = MouseEvent {
+        column: 3,
+        row: 2,
+        button: MouseButton::WheelUp,
+        action: MouseAction::Press,
+        modifiers: Modifiers::default(),
+    };
+    let mut expected = encode_mouse(&press, &modes)
+        .ok_or_else(|| "encode_mouse returned None for a click".to_string())?;
+    expected.extend(
+        encode_mouse(&wheel, &modes)
+            .ok_or_else(|| "encode_mouse returned None for a wheel".to_string())?,
+    );
+
+    control
+        .send_bytes(pane, expected.clone())
+        .map_err(|err| err.to_string())?;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut seen = false;
+    while Instant::now() < deadline && !seen {
+        let _ = control
+            .pump(Duration::from_millis(100))
+            .map_err(|err| err.to_string())?;
+        if let Ok(bytes) = std::fs::read(&probe_file) {
+            seen = bytes
+                .windows(expected.len())
+                .any(|window| window == expected.as_slice());
+        }
+    }
+
+    report.check(
+        "the SGR mouse encoding is used",
+        expected.starts_with(b"\x1b[<"),
+        format!("encoded {:?}", String::from_utf8_lossy(&expected)),
+    );
+    let observed = std::fs::read(&probe_file).unwrap_or_default();
+    let pane_text = tmux
+        .run(&["capture-pane", "-p", "-t", &probe_session])
+        .unwrap_or_default();
+    report.check(
+        "the mouse report reached the pane application byte-for-byte",
+        seen,
+        format!(
+            "pane={pane}, expected {:?}, file({} bytes)={:?}, pane text={:?}",
+            String::from_utf8_lossy(&expected),
+            observed.len(),
+            String::from_utf8_lossy(&observed),
+            pane_text.trim()
+        ),
+    );
+
+    control.close();
+    tmux.run_ignoring_errors(&["kill-session", "-t", &probe_session]);
+    let _ = std::fs::remove_file(&probe_file);
+    Ok(report)
 }
 
 /// Result of the takeover/leak scenario.

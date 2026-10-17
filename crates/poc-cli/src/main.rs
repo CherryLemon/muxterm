@@ -4,6 +4,8 @@
 //! poc create    --socket <name> [--session poc]
 //! poc snapshot  --socket <name> [--session poc]
 //! poc stream    --socket <name> [--session poc] [--seconds 5]
+//! poc resize    --socket <name> [--session poc]
+//! poc mouse     --socket <name> [--session poc]
 //! poc reconnect --socket <name> [--session poc] [--detach-seconds 3]
 //! poc leak      --socket <name> [--session poc] [--inject-bug]
 //! ```
@@ -82,7 +84,9 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(command) = args.first().cloned() else {
-        eprintln!("usage: poc <create|snapshot|stream|reconnect|leak|core-gate|doctor> [options]");
+        eprintln!(
+            "usage: poc <create|snapshot|stream|resize|mouse|reconnect|leak|core-gate|doctor> [options]"
+        );
         return ExitCode::from(2);
     };
     let options = match parse_options(&args[1..]) {
@@ -98,6 +102,8 @@ fn main() -> ExitCode {
         "create" => cmd_create(&tmux, &options),
         "snapshot" => cmd_snapshot(&tmux, &options),
         "stream" => cmd_stream(&tmux, &options),
+        "resize" => cmd_resize(&tmux, &options),
+        "mouse" => cmd_mouse(&tmux, &options),
         "reconnect" => cmd_reconnect(&tmux, &options),
         "leak" => cmd_leak(&tmux, &options),
         "core-gate" => cmd_core_gate(&tmux, &options),
@@ -232,6 +238,33 @@ fn cmd_stream(tmux: &Tmux, options: &Options) -> Result<(), String> {
     );
     session.close();
     Ok(())
+}
+
+/// Proves that `refresh-client -C` resizes the remote window and reaches the model.
+fn cmd_resize(tmux: &Tmux, options: &Options) -> Result<(), String> {
+    if !tmux.is_running() {
+        scenarios::create_poc_session(tmux, &options.session)?;
+    }
+    println!("scenario: client resize (session {})", options.session);
+    let report = scenarios::resize(tmux, &options.session)?;
+    let code = report.print();
+    if code == 0 {
+        Ok(())
+    } else {
+        Err("resize scenario failed".to_string())
+    }
+}
+
+/// Proves that an encoded mouse report reaches a pane application byte-for-byte.
+fn cmd_mouse(tmux: &Tmux, options: &Options) -> Result<(), String> {
+    println!("scenario: mouse input (session {})", options.session);
+    let report = scenarios::mouse(tmux, &options.session)?;
+    let code = report.print();
+    if code == 0 {
+        Ok(())
+    } else {
+        Err("mouse scenario failed".to_string())
+    }
 }
 
 fn cmd_reconnect(tmux: &Tmux, options: &Options) -> Result<(), String> {
