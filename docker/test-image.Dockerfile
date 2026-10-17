@@ -49,15 +49,32 @@ RUN apt-get update -qq \
       bison \
  && rm -rf /var/lib/apt/lists/*
 
+# The compatibility matrix exercises tmux 3.4 (the recordings in
+# crates/tmux-protocol/tests/fixtures were made with it).  Debian bookworm's
+# package is 3.3a, so 3.4 is built here from the public release tarball and put
+# first in PATH.  3.3a remains installed as the oldest supported baseline.
+RUN set -eux; \
+    curl -fsSL -o /tmp/tmux.tar.gz \
+      https://github.com/tmux/tmux/releases/download/3.4/tmux-3.4.tar.gz; \
+    tar -C /tmp -xzf /tmp/tmux.tar.gz; \
+    cd /tmp/tmux-3.4; \
+    ./configure --prefix=/opt/tmux/3.4; \
+    make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"; \
+    make install; \
+    ln -sf /opt/tmux/3.4/bin/tmux /usr/local/bin/tmux; \
+    rm -rf /tmp/tmux-3.4 /tmp/tmux.tar.gz; \
+    tmux -V
+
 # Lint components are optional: without network access the image still builds and the
 # lint stage of tools/container/test.sh reports that clippy is unavailable.
 RUN rustup component add clippy rustfmt \
  && (cargo clippy --version || true) \
  && (cargo fmt --version || true)
 
-# Extra tmux versions from the compatibility matrix are built into
-# /opt/tmux/<version>/bin/tmux by tools/container/build-tmux-versions.sh and selected
-# with PATH.
+# Extra versions from the compatibility matrix (3.3a, 3.5a, 3.8) are built into
+# /opt/tmux/<version>/bin/tmux by tools/container/build-tmux-versions.sh and
+# selected with PATH.  The script is not copied into the image by default; run it
+# inside a checkout/container.
 
 # Deterministic locale so byte/width tests do not depend on the host.
 ENV LANG=C.UTF-8 \

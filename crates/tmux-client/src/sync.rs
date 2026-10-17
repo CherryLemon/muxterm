@@ -29,10 +29,11 @@
 //! 2. `list-sessions`, 3. `list-windows -a`, 4. `list-panes -a`
 //! 5. per pane: `capture-pane` — the watermark, 6. per pane: pane metadata.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use tmux_protocol::command::Command;
 use tmux_protocol::ids::{PaneId, SessionId, WindowId};
+use tmux_protocol::limits::Limits;
 use tmux_protocol::queue::Response;
 
 use crate::model::{ModelChange, PaneState, RemoteModel};
@@ -123,6 +124,15 @@ pub enum SyncError {
         /// What was wrong.
         detail: String,
     },
+    /// A response was cut short by [`tmux_protocol::Limits`].
+    ///
+    /// A truncated `capture-pane` is especially dangerous: it contains the
+    /// *oldest* history lines, not the visible screen, so applying it would paint
+    /// a screen that is minutes or hours stale.
+    Truncated {
+        /// Stage whose response was truncated.
+        tag: Tag,
+    },
     /// The connection ended before the snapshot completed.
     Interrupted,
 }
@@ -132,6 +142,9 @@ impl core::fmt::Display for SyncError {
         match self {
             Self::CommandFailed { tag, message } => write!(f, "{tag:?} failed: {message}"),
             Self::Malformed { tag, detail } => write!(f, "{tag:?} response malformed: {detail}"),
+            Self::Truncated { tag } => {
+                write!(f, "{tag:?} response exceeded the configured limits")
+            }
             Self::Interrupted => write!(f, "connection closed during snapshot"),
         }
     }
@@ -143,9 +156,13 @@ impl std::error::Error for SyncError {}
 #[derive(Debug, Clone)]
 pub struct SyncEngine {
     marker: String,
+    /// Upper bound on the number of body lines one response may carry.
+    max_capture_lines: u32,
     started: bool,
     finished: bool,
     panes: Vec<PaneId>,
+    /// Height of each pane as reported by `list-panes`, used to bound its capture.
+    pane_heights: BTreeMap<PaneId, u32>,
     meta_seen: BTreeSet<PaneId>,
     queued: VecDeque<TaggedCommand>,
     stats: SyncStats,
@@ -153,13 +170,20 @@ pub struct SyncEngine {
 
 impl SyncEngine {
     /// Creates an engine that will use `marker` for its barrier command.
+    ///
+    /// `limits.max_response_lines` is also the budget for a `capture-pane`: the
+    /// capture asks for at most `max_response_lines - pane_height` history lines,
+    /// so the response can never be truncated into "the oldest history pretending
+    /// to be the screen".
     #[must_use]
-    pub fn new(marker: impl Into<String>) -> Self {
+    pub fn new(marker: impl Into<String>, limits: Limits) -> Self {
         Self {
             marker: marker.into(),
+            max_capture_lines: limits.max_response_lines,
             started: false,
             finished: false,
             panes: Vec::new(),
+            pane_heights: BTreeMap::new(),
             meta_seen: BTreeSet::new(),
             queued: VecDeque::new(),
             stats: SyncStats::default(),
@@ -223,6 +247,9 @@ impl SyncEngine {
         response: &Response,
         model: &mut RemoteModel,
     ) -> Result<SyncOutcome, SyncError> {
+        if response.truncated {
+            return Err(SyncError::Truncated { tag });
+        }
         if !response.ok {
             return Err(SyncError::CommandFailed {
                 tag,
@@ -257,12 +284,7 @@ impl SyncEngine {
                         detail: format!("session line {:?}", String::from_utf8_lossy(line)),
                     })?;
                     self.stats.sessions += 1;
-                    changes.push(model.upsert_session(
-                        parsed.id,
-                        parsed.name,
-                        parsed.windows,
-                        parsed.current,
-                    ));
+                    changes.push(model.upsert_session(parsed.id, parsed.name, parsed.window_count));
                 }
                 self.queued.push_back(TaggedCommand {
                     command: Command::new("list-windows")
@@ -280,15 +302,26 @@ impl SyncEngine {
                         detail: format!("window line {:?}", String::from_utf8_lossy(line)),
                     })?;
                     self.stats.windows += 1;
-                    changes.push(model.upsert_window(
+                    changes.extend(model.upsert_window(
                         parsed.id,
                         Some(parsed.session),
                         parsed.index,
+                        parsed.active,
                         parsed.name,
                     ));
                     if !parsed.layout.is_empty() {
-                        match model.set_layout(parsed.id, parsed.layout) {
-                            Ok(change) => changes.push(change),
+                        let flags: Vec<Vec<u8>> = if parsed.zoomed {
+                            vec![b"zoomed".to_vec()]
+                        } else {
+                            Vec::new()
+                        };
+                        match model.set_layout(
+                            parsed.id,
+                            parsed.layout,
+                            parsed.visible_layout,
+                            &flags,
+                        ) {
+                            Ok(updates) => changes.extend(updates),
                             Err(reason) => changes.push(model.mark_desynchronised(format!(
                                 "layout of {} not understood: {reason}",
                                 parsed.id
@@ -307,6 +340,7 @@ impl SyncEngine {
             }
             Tag::ListPanes => {
                 self.panes.clear();
+                self.pane_heights.clear();
                 self.meta_seen.clear();
                 for line in &response.lines {
                     let parsed = parse_pane_line(line).ok_or_else(|| SyncError::Malformed {
@@ -315,6 +349,7 @@ impl SyncEngine {
                     })?;
                     self.stats.panes += 1;
                     self.panes.push(parsed.id);
+                    self.pane_heights.insert(parsed.id, parsed.height);
                     changes.push(model.upsert_pane(
                         parsed.id,
                         PaneState {
@@ -390,8 +425,9 @@ impl SyncEngine {
 
     fn enqueue_pane_steps(&mut self) {
         for pane in self.panes.clone() {
+            let height = self.pane_heights.get(&pane).copied().unwrap_or(0);
             self.queued.push_back(TaggedCommand {
-                command: capture_command(pane),
+                command: capture_command(pane, self.capture_history(height)),
                 tag: Tag::CapturePane,
                 pane: Some(pane),
             });
@@ -402,6 +438,15 @@ impl SyncEngine {
             });
         }
     }
+
+    /// How many history lines a pane of `pane_height` rows may ask for without
+    /// exceeding the response-line budget.
+    ///
+    /// A zero budget asks for the visible screen only (`-S 0`); the caller no
+    /// longer applies a truncated capture, it fails the snapshot.
+    fn capture_history(&self, pane_height: u32) -> u32 {
+        self.max_capture_lines.saturating_sub(pane_height)
+    }
 }
 
 /// Formats used by the snapshot queries.
@@ -409,11 +454,15 @@ impl SyncEngine {
 /// A variable-length field (a name or a title) is always **last**, so a line can be
 /// split with a bounded split count: names may contain spaces and no separator
 /// character is forbidden inside a window name.
-pub const SESSION_FORMAT: &str =
-    "#{session_id} #{session_windows} #{session_attached} #{session_name}";
+pub const SESSION_FORMAT: &str = "#{session_id} #{session_windows} #{session_name}";
 /// Window list format: name last.
-pub const WINDOW_FORMAT: &str =
-    "#{session_id} #{window_id} #{window_index} #{window_active} #{window_layout} #{window_name}";
+///
+/// `window_visible_layout` is the zoomed layout when the window is zoomed (the
+/// normal `window_layout` keeps the real split tree).  `window_zoomed_flag` says
+/// which one is on screen.
+pub const WINDOW_FORMAT: &str = "#{session_id} #{window_id} #{window_index} \
+     #{window_active} #{window_zoomed_flag} #{window_layout} #{window_visible_layout} \
+     #{window_name}";
 /// Pane list format: title last.
 pub const PANE_FORMAT: &str = "#{window_id} #{pane_id} #{pane_index} #{pane_width} #{pane_height} \
      #{pane_active} #{pane_dead} #{pane_in_mode} #{pane_title}";
@@ -426,8 +475,9 @@ pub const PANE_META_FORMAT: &str =
 ///
 /// `-e` keeps escape sequences (styles, alternate-screen switches and mode
 /// changes), `-N` preserves trailing spaces so a row keeps its geometry, `-q` stays
-/// quiet about missing panes, and `-S -`/`-E -` asks for everything the server
-/// still has.
+/// quiet about missing panes, and `-S <history>`/`-E -` bounds the capture to the
+/// configured response budget.  `history_lines = 0` captures the visible screen
+/// only.
 ///
 /// `-J` (join wrapped lines) is deliberately **not** used: it turns physical rows
 /// into logical lines, so the last `rows` captured lines are no longer the visible
@@ -435,14 +485,19 @@ pub const PANE_META_FORMAT: &str =
 /// — becomes ambiguous.  The cost is that a wrapped logical line is restored as two
 /// physical rows without the wrap flag; `docs/spec/state-sync.md` §5 records that.
 #[must_use]
-pub fn capture_command(pane: PaneId) -> Command {
+pub fn capture_command(pane: PaneId, history_lines: u32) -> Command {
+    let start = if history_lines == 0 {
+        "0".to_string()
+    } else {
+        format!("-{history_lines}")
+    };
     Command::new("capture-pane")
         .arg("-p")
         .arg("-e")
         .arg("-q")
         .arg("-N")
         .arg("-S")
-        .arg("-")
+        .arg(start)
         .arg("-E")
         .arg("-")
         .arg("-t")
@@ -468,10 +523,6 @@ pub struct SessionRow {
     pub window_count: u32,
     /// Session name.
     pub name: Vec<u8>,
-    /// Window ids, filled in later from the window list.
-    pub windows: Vec<WindowId>,
-    /// Current window, filled in later.
-    pub current: Option<WindowId>,
 }
 
 /// A window row.
@@ -485,8 +536,12 @@ pub struct WindowRow {
     pub index: u32,
     /// True when this is the session's current window.
     pub active: bool,
-    /// Raw layout string.
+    /// True when the window is zoomed.
+    pub zoomed: bool,
+    /// Raw layout string (the real split tree).
     pub layout: Vec<u8>,
+    /// Raw visible layout string (a single pane when zoomed).
+    pub visible_layout: Vec<u8>,
     /// Window name.
     pub name: Vec<u8>,
 }
@@ -563,26 +618,27 @@ fn parse_flag(bytes: &[u8]) -> bool {
 /// Parses one `list-sessions` line.
 #[must_use]
 pub fn parse_session_line(line: &[u8]) -> Option<SessionRow> {
-    let [id, window_count, _attached, name] = split_bounded::<4>(line)?;
+    let [id, window_count, name] = split_bounded::<3>(line)?;
     Some(SessionRow {
         id: SessionId::from_wire(id)?,
         window_count: parse_u32(window_count)?,
         name: name.to_vec(),
-        windows: Vec::new(),
-        current: None,
     })
 }
 
 /// Parses one `list-windows` line.
 #[must_use]
 pub fn parse_window_line(line: &[u8]) -> Option<WindowRow> {
-    let [session, id, index, active, layout, name] = split_bounded::<6>(line)?;
+    let [session, id, index, active, zoomed, layout, visible_layout, name] =
+        split_bounded::<8>(line)?;
     Some(WindowRow {
         session: SessionId::from_wire(session)?,
         id: WindowId::from_wire(id)?,
         index: parse_u32(index)?,
         active: parse_flag(active),
+        zoomed: parse_flag(zoomed),
         layout: layout.to_vec(),
+        visible_layout: visible_layout.to_vec(),
         name: name.to_vec(),
     })
 }
@@ -646,7 +702,7 @@ mod tests {
 
     #[test]
     fn parses_session_lines_with_spaces_in_the_name() {
-        let row = parse_session_line(b"$0 2 1 my session").unwrap();
+        let row = parse_session_line(b"$0 2 my session").unwrap();
         assert_eq!(row.id, SessionId::new(0));
         assert_eq!(row.window_count, 2);
         assert_eq!(row.name, b"my session");
@@ -654,13 +710,27 @@ mod tests {
 
     #[test]
     fn parses_window_lines() {
-        let row = parse_window_line(b"$0 @1 1 1 bb62,80x24,0,0,0 editor window").unwrap();
+        let row = parse_window_line(b"$0 @1 1 1 0 bb62,80x24,0,0,0 bb62,80x24,0,0,0 editor window")
+            .unwrap();
         assert_eq!(row.session, SessionId::new(0));
         assert_eq!(row.id, WindowId::new(1));
         assert_eq!(row.index, 1);
         assert!(row.active);
+        assert!(!row.zoomed);
         assert_eq!(row.layout, b"bb62,80x24,0,0,0");
+        assert_eq!(row.visible_layout, b"bb62,80x24,0,0,0");
         assert_eq!(row.name, b"editor window");
+    }
+
+    #[test]
+    fn parses_a_zoomed_window_line() {
+        let row = parse_window_line(
+            b"$0 @1 0 0 1 bb62,80x24,0,0[80x12,0,0,0,80x11,0,13,1] bb62,80x24,0,0[80x24,0,0,0] w",
+        )
+        .unwrap();
+        assert!(row.zoomed);
+        assert_eq!(row.layout, b"bb62,80x24,0,0[80x12,0,0,0,80x11,0,13,1]");
+        assert_eq!(row.visible_layout, b"bb62,80x24,0,0[80x24,0,0,0]");
     }
 
     #[test]
@@ -687,7 +757,7 @@ mod tests {
 
     #[test]
     fn malformed_rows_are_rejected_not_guessed() {
-        assert!(parse_session_line(b"$0 2 1").is_none());
+        assert!(parse_session_line(b"$0 2").is_none());
         assert!(parse_window_line(b"nonsense").is_none());
         assert!(parse_pane_line(b"@1 %3 1 80 24").is_none());
         assert!(parse_pane_meta(b"1 2 3").is_none());
@@ -695,7 +765,7 @@ mod tests {
 
     #[test]
     fn snapshot_runs_in_the_documented_order_and_watermarks_each_pane() {
-        let mut engine = SyncEngine::new("__m__");
+        let mut engine = SyncEngine::new("__m__", Limits::default());
         let mut model = model();
 
         let first = engine.next_command().unwrap();
@@ -712,7 +782,7 @@ mod tests {
             .on_response(
                 Tag::ListSessions,
                 None,
-                &response(&[b"$0 1 1 dev"]),
+                &response(&[b"$0 1 dev"]),
                 &mut model,
             )
             .unwrap();
@@ -723,10 +793,21 @@ mod tests {
             .on_response(
                 Tag::ListWindows,
                 None,
-                &response(&[b"$0 @0 0 1 bb62,80x24,0,0,0 shell"]),
+                &response(&[b"$0 @0 0 1 0 bb62,80x24,0,0,0 bb62,80x24,0,0,0 shell"]),
                 &mut model,
             )
             .unwrap();
+
+        assert_eq!(
+            model.sessions()[&SessionId::new(0)].windows,
+            vec![WindowId::new(0)],
+            "the window list must populate the session→window relation"
+        );
+        assert_eq!(
+            model.sessions()[&SessionId::new(0)].current_window,
+            Some(WindowId::new(0)),
+            "window_active selects the current window"
+        );
 
         let panes = engine.next_command().unwrap();
         assert_eq!(panes.tag, Tag::ListPanes);
@@ -742,6 +823,15 @@ mod tests {
         let capture = engine.next_command().unwrap();
         assert_eq!(capture.tag, Tag::CapturePane);
         assert_eq!(capture.pane, Some(PaneId::new(0)));
+        let encoded = capture
+            .command
+            .encode(Limits::default())
+            .expect("capture encodes");
+        assert!(
+            String::from_utf8_lossy(&encoded).contains("-S -4072"),
+            "a 24-row pane under a 4096-line budget asks for 4072 history lines, got {:?}",
+            String::from_utf8_lossy(&encoded)
+        );
         let outcome = engine
             .on_response(
                 Tag::CapturePane,
@@ -788,7 +878,7 @@ mod tests {
 
     #[test]
     fn a_failed_snapshot_command_is_reported() {
-        let mut engine = SyncEngine::new("__m__");
+        let mut engine = SyncEngine::new("__m__", Limits::default());
         let mut model = model();
         let _ = engine.next_command();
         let mut bad = response(&[b"no server"]);
@@ -801,7 +891,7 @@ mod tests {
 
     #[test]
     fn a_wrong_barrier_marker_is_rejected() {
-        let mut engine = SyncEngine::new("__m__");
+        let mut engine = SyncEngine::new("__m__", Limits::default());
         let mut model = model();
         let _ = engine.next_command();
         let err = engine
@@ -811,11 +901,47 @@ mod tests {
     }
 
     #[test]
-    fn capture_command_asks_for_styles_and_the_full_history() {
-        let encoded = capture_command(PaneId::new(2))
+    fn capture_command_bounds_history_and_keeps_styles() {
+        let bounded = capture_command(PaneId::new(2), 20)
             .encode(Limits::default())
             .unwrap();
-        let text = String::from_utf8(encoded).unwrap();
-        assert_eq!(text, "capture-pane -p -e -q -N -S - -E - -t %2\n");
+        assert_eq!(
+            String::from_utf8(bounded).unwrap(),
+            "capture-pane -p -e -q -N -S -20 -E - -t %2\n"
+        );
+
+        let visible_only = capture_command(PaneId::new(2), 0)
+            .encode(Limits::default())
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(visible_only).unwrap(),
+            "capture-pane -p -e -q -N -S 0 -E - -t %2\n"
+        );
+    }
+
+    #[test]
+    fn a_truncated_snapshot_response_is_rejected() {
+        let mut engine = SyncEngine::new("__m__", Limits::default());
+        let mut model = model();
+        let mut truncated = response(&[b"old history"]);
+        truncated.truncated = true;
+        let err = engine
+            .on_response(
+                Tag::CapturePane,
+                Some(PaneId::new(0)),
+                &truncated,
+                &mut model,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SyncError::Truncated {
+                tag: Tag::CapturePane
+            }
+        ));
+        assert!(
+            !model.pane_is_ready(PaneId::new(0)),
+            "a truncated capture must never become a pane snapshot"
+        );
     }
 }

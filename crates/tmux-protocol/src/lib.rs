@@ -58,7 +58,7 @@ pub use switch::{SwitchAction, TakeoverSwitch};
 ///
 /// Kept in step with `docs/spec/control-mode.md`; the compatibility matrix is in
 /// `docs/spec/compatibility.md`.
-pub const SPEC_VERSION: &str = "control-mode/0.1";
+pub const SPEC_VERSION: &str = "control-mode/0.2";
 
 /// Default nonce marker used to find the end of the unsolicited initialisation
 /// responses.  The client sends `display-message -p <SYNC_MARKER>` and treats

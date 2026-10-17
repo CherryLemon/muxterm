@@ -145,7 +145,6 @@ pub struct CommandQueue {
     pending: VecDeque<(RequestId, Vec<u8>)>,
     in_flight: VecDeque<RequestId>,
     open: Option<OpenResponse>,
-    unsolicited: Vec<Response>,
     barrier: Option<Barrier>,
     closed: bool,
 }
@@ -160,7 +159,6 @@ impl CommandQueue {
             pending: VecDeque::new(),
             in_flight: VecDeque::new(),
             open: None,
-            unsolicited: Vec::new(),
             barrier: None,
             closed: false,
         }
@@ -245,6 +243,16 @@ impl CommandQueue {
         self.barrier.as_ref().map(|barrier| barrier.request)
     }
 
+    /// Releases the queue from a synchronisation barrier without an answer.
+    ///
+    /// A barrier is normally cleared when its response carries the expected
+    /// marker.  During resynchronisation that response may never arrive (the
+    /// block was truncated, or the server never answered), and keeping the
+    /// barrier would stall every later command forever.
+    pub fn clear_barrier(&mut self) {
+        self.barrier = None;
+    }
+
     /// Number of commands awaiting a response or a write.
     #[must_use]
     pub fn outstanding(&self) -> usize {
@@ -312,10 +320,10 @@ impl CommandQueue {
             }
             Event::ResponseEnd(header) => self.finish(true, *header),
             Event::ResponseError(header) => self.finish(false, *header),
-            Event::Desync {
-                reason: crate::parser::Desync::ResponseTooLarge,
-                ..
-            } => {
+            // Any desynchronisation while a block is open means its content can
+            // no longer be trusted: `LineTooLong` drops part of the body just as
+            // `ResponseTooLarge` does.
+            Event::Desync { .. } => {
                 if let Some(open) = self.open.as_mut() {
                     open.truncated = true;
                 }
@@ -358,17 +366,15 @@ impl CommandQueue {
                 .take()
                 .expect("a barrier response always has a request");
             // The command is still unanswered: give it back its place in flight.
+            // The block is returned as unsolicited (`request == None`); the caller
+            // owns it, so no second copy is retained here.
             self.in_flight.push_front(request);
-            self.unsolicited.push(response.clone());
             return Some(response);
         }
         if barrier_matched {
             self.barrier = None;
         }
 
-        if response.request.is_none() {
-            self.unsolicited.push(response.clone());
-        }
         Some(response)
     }
 
@@ -405,11 +411,6 @@ impl CommandQueue {
             });
         }
         failed
-    }
-
-    /// Takes the unsolicited (initialisation) responses seen so far.
-    pub fn take_unsolicited(&mut self) -> Vec<Response> {
-        std::mem::take(&mut self.unsolicited)
     }
 }
 
@@ -504,7 +505,6 @@ mod tests {
             Some(id),
             "the first user command gets its own answer"
         );
-        assert_eq!(q.take_unsolicited().len(), 1);
     }
 
     #[test]
@@ -539,7 +539,6 @@ mod tests {
         let answered = q.on_event(&end(2)).unwrap();
         assert_eq!(answered.request, Some(marker));
         assert_eq!(q.barrier(), None);
-        assert_eq!(q.take_unsolicited().len(), 1);
         assert_eq!(q.next_to_write().unwrap().0, after);
     }
 
@@ -591,6 +590,51 @@ mod tests {
         });
         let response = q.on_event(&end(1)).unwrap();
         assert!(response.truncated);
+    }
+
+    #[test]
+    fn any_desync_truncates_an_open_response() {
+        let mut q = queue();
+        let id = q.enqueue(&Command::new("capture-pane")).unwrap();
+        let _ = q.next_to_write();
+        q.on_event(&begin(1));
+        q.on_event(&Event::ResponseLine(b"partial".to_vec()));
+        q.on_event(&Event::Desync {
+            reason: crate::parser::Desync::LineTooLong,
+            dropped_bytes: 512,
+        });
+        let response = q.on_event(&end(1)).unwrap();
+        assert_eq!(response.request, Some(id));
+        assert!(response.ok, "the block itself ended cleanly");
+        assert!(
+            response.truncated,
+            "a line dropped inside the block must mark the body unreliable"
+        );
+        assert!(!response.is_complete_for(id));
+    }
+
+    #[test]
+    fn clear_barrier_releases_writes() {
+        let mut q = CommandQueue::new(Limits {
+            max_in_flight_commands: 2,
+            ..Limits::default()
+        });
+        let marker = q.enqueue(&Command::new("display-message")).unwrap();
+        q.set_barrier(marker, b"__marker__".to_vec()).unwrap();
+        let after = q.enqueue(&Command::new("list-panes")).unwrap();
+        assert_eq!(q.next_to_write().unwrap().0, marker);
+        assert!(
+            q.next_to_write().is_none(),
+            "the barrier must hold later commands back"
+        );
+
+        q.clear_barrier();
+        assert_eq!(q.barrier(), None);
+        assert_eq!(
+            q.next_to_write().unwrap().0,
+            after,
+            "clearing the barrier must release the queued command"
+        );
     }
 
     #[test]
