@@ -145,7 +145,6 @@ pub struct CommandQueue {
     pending: VecDeque<(RequestId, Vec<u8>)>,
     in_flight: VecDeque<RequestId>,
     open: Option<OpenResponse>,
-    unsolicited: Vec<Response>,
     barrier: Option<Barrier>,
     closed: bool,
 }
@@ -160,7 +159,6 @@ impl CommandQueue {
             pending: VecDeque::new(),
             in_flight: VecDeque::new(),
             open: None,
-            unsolicited: Vec::new(),
             barrier: None,
             closed: false,
         }
@@ -368,17 +366,15 @@ impl CommandQueue {
                 .take()
                 .expect("a barrier response always has a request");
             // The command is still unanswered: give it back its place in flight.
+            // The block is returned as unsolicited (`request == None`); the caller
+            // owns it, so no second copy is retained here.
             self.in_flight.push_front(request);
-            self.unsolicited.push(response.clone());
             return Some(response);
         }
         if barrier_matched {
             self.barrier = None;
         }
 
-        if response.request.is_none() {
-            self.unsolicited.push(response.clone());
-        }
         Some(response)
     }
 
@@ -415,11 +411,6 @@ impl CommandQueue {
             });
         }
         failed
-    }
-
-    /// Takes the unsolicited (initialisation) responses seen so far.
-    pub fn take_unsolicited(&mut self) -> Vec<Response> {
-        std::mem::take(&mut self.unsolicited)
     }
 }
 
@@ -514,7 +505,6 @@ mod tests {
             Some(id),
             "the first user command gets its own answer"
         );
-        assert_eq!(q.take_unsolicited().len(), 1);
     }
 
     #[test]
@@ -549,7 +539,6 @@ mod tests {
         let answered = q.on_event(&end(2)).unwrap();
         assert_eq!(answered.request, Some(marker));
         assert_eq!(q.barrier(), None);
-        assert_eq!(q.take_unsolicited().len(), 1);
         assert_eq!(q.next_to_write().unwrap().0, after);
     }
 
