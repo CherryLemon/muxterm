@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -39,11 +39,128 @@ pub enum Target {
     },
 }
 
+/// Why a [`Target`] cannot be turned into a process invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetError {
+    /// A session name is empty.
+    EmptySession,
+    /// A session name contains a newline, carriage return or NUL.
+    InvalidSession,
+    /// A socket name is empty or contains an unusable byte.
+    InvalidSocket,
+    /// An SSH host is empty, starts with `-` (which would be read as an option),
+    /// or contains whitespace/control bytes.
+    InvalidHost,
+    /// An SSH option contains a NUL byte, which an argv element cannot carry.
+    InvalidSshOption,
+}
+
+impl core::fmt::Display for TargetError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::EmptySession => write!(f, "the session name is empty"),
+            Self::InvalidSession => {
+                write!(
+                    f,
+                    "the session name contains a newline, carriage return or NUL"
+                )
+            }
+            Self::InvalidSocket => {
+                write!(f, "the socket name is empty or contains a newline or NUL")
+            }
+            Self::InvalidHost => write!(
+                f,
+                "the SSH host is empty, starts with '-', or contains whitespace/control bytes"
+            ),
+            Self::InvalidSshOption => write!(f, "an SSH option contains a NUL byte"),
+        }
+    }
+}
+
+impl std::error::Error for TargetError {}
+
+/// A tmux object name (session/socket) that can travel through argv or a remote
+/// command line without changing the meaning of the command.
+fn valid_tmux_name(name: &str) -> bool {
+    !name.is_empty() && !name.bytes().any(|byte| matches!(byte, 0 | b'\n' | b'\r'))
+}
+
+/// An SSH destination that cannot be mistaken for an option or split by the
+/// remote shell.
+fn valid_ssh_host(host: &str) -> bool {
+    !host.is_empty()
+        && !host.starts_with('-')
+        && !host
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_whitespace() || byte.is_ascii_control())
+}
+
 impl Target {
+    /// Checks that every field can be passed to the process without a quoting
+    /// accident.
+    ///
+    /// # Errors
+    ///
+    /// Returns the offending field as a [`TargetError`].  This is deliberately
+    /// strict: a host beginning with `-` would be parsed by `ssh` as an option,
+    /// and a session name containing a newline cannot be represented in a command
+    /// line.
+    pub fn validate(&self) -> Result<(), TargetError> {
+        match self {
+            Self::Local { socket, session } => {
+                if session.is_empty() {
+                    return Err(TargetError::EmptySession);
+                }
+                if !valid_tmux_name(session) {
+                    return Err(TargetError::InvalidSession);
+                }
+                if let Some(socket) = socket {
+                    if !valid_tmux_name(socket) {
+                        return Err(TargetError::InvalidSocket);
+                    }
+                }
+            }
+            Self::Ssh {
+                host,
+                socket,
+                session,
+                ssh_options,
+            } => {
+                if !valid_ssh_host(host) {
+                    return Err(TargetError::InvalidHost);
+                }
+                if session.is_empty() {
+                    return Err(TargetError::EmptySession);
+                }
+                if !valid_tmux_name(session) {
+                    return Err(TargetError::InvalidSession);
+                }
+                if let Some(socket) = socket {
+                    if !valid_tmux_name(socket) {
+                        return Err(TargetError::InvalidSocket);
+                    }
+                }
+                if ssh_options
+                    .iter()
+                    .any(|option| option.as_bytes().contains(&0))
+                {
+                    return Err(TargetError::InvalidSshOption);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Builds the program and its argv.
     ///
     /// For [`Target::Ssh`] the remote command is a single argv element, quoted for
     /// the remote shell by [`shell_quote`].
+    ///
+    /// The SSH invocation appends a small set of robustness defaults *after* the
+    /// caller's options: `ssh` keeps the first value it sees for an option, so a
+    /// user-supplied `-o` still wins, while a plain target never hangs on an
+    /// interactive password prompt (`BatchMode=yes`) or a silent half-open
+    /// connection (`ServerAliveInterval`).
     #[must_use]
     pub fn command(&self) -> (String, Vec<String>) {
         match self {
@@ -77,6 +194,9 @@ impl Target {
 
                 let mut args: Vec<String> = vec!["-T".to_string()];
                 args.extend(ssh_options.iter().cloned());
+                for option in SSH_DEFAULT_OPTIONS {
+                    args.push((*option).to_string());
+                }
                 args.push(host.clone());
                 args.push(tmux_argv.join(" "));
                 ("ssh".to_string(), args)
@@ -104,6 +224,21 @@ impl Target {
         }
     }
 }
+
+/// Options appended to every SSH invocation.
+///
+/// They come after the caller's `ssh_options`, and `ssh` keeps the first value it
+/// sees for an option, so an explicit user value always wins.
+const SSH_DEFAULT_OPTIONS: &[&str] = &[
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=15",
+    "-o",
+    "ServerAliveInterval=30",
+    "-o",
+    "ServerAliveCountMax=3",
+];
 
 /// Quotes one argument for a POSIX shell.
 ///
@@ -207,6 +342,14 @@ enum Message {
 
 const STDERR_TAIL_BYTES: usize = 4096;
 
+/// Chunks the reader thread may run ahead of the consumer.
+///
+/// The parser has bounds of its own, but the pipe between the child process and
+/// the parser is upstream of them: an unbounded channel would let a slow GUI grow
+/// memory without limit.  64 chunks of 64 KiB is a 4 MiB ceiling; when it is full
+/// the reader blocks and the child's pty/pipe applies backpressure.
+const TRANSPORT_QUEUE_CHUNKS: usize = 64;
+
 /// A control-mode client running as a child process (local tmux or ssh).
 pub struct ProcessTransport {
     child: Child,
@@ -215,6 +358,9 @@ pub struct ProcessTransport {
     stderr: Arc<Mutex<VecDeque<u8>>>,
     closed: bool,
     eof_seen: bool,
+    /// Set once the child has been waited for; `closed` is not enough because a
+    /// failed write also closes the channel but must still be reaped.
+    reaped: bool,
     description: String,
 }
 
@@ -225,6 +371,9 @@ impl ProcessTransport {
     ///
     /// Returns the spawn error when the program cannot be started.
     pub fn spawn(target: &Target) -> io::Result<Self> {
+        target
+            .validate()
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
         let (program, args) = target.command();
         let mut command = Command::new(&program);
         command.args(&args);
@@ -248,7 +397,7 @@ impl ProcessTransport {
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(TRANSPORT_QUEUE_CHUNKS);
 
         if let Some(stdout) = stdout {
             spawn_reader(stdout, tx.clone());
@@ -268,6 +417,7 @@ impl ProcessTransport {
             stderr: tail,
             closed: false,
             eof_seen: false,
+            reaped: false,
             description,
         })
     }
@@ -279,7 +429,7 @@ impl ProcessTransport {
     }
 }
 
-fn spawn_reader(mut stdout: impl Read + Send + 'static, tx: Sender<Message>) {
+fn spawn_reader(mut stdout: impl Read + Send + 'static, tx: SyncSender<Message>) {
     std::thread::spawn(move || {
         let mut buf = vec![0u8; 64 * 1024];
         loop {
@@ -364,9 +514,13 @@ impl Transport for ProcessTransport {
     }
 
     fn shutdown(&mut self) {
-        if self.closed {
+        // `closed` is also set by a failed write; only `reaped` proves the child
+        // was waited for.  Returning early on `closed` used to leak a zombie (and
+        // possibly a live tmux/ssh client) after the first write error.
+        if self.reaped {
             return;
         }
+        self.reaped = true;
         self.closed = true;
         // Closing stdin is a graceful detach: tmux exits the control client but
         // leaves the session and its processes running.
@@ -434,11 +588,69 @@ mod tests {
         }
         .command();
         assert_eq!(program, "ssh");
-        assert_eq!(args[0], "-T");
-        assert_eq!(args[1], "-p");
-        assert_eq!(args[2], "2224");
-        assert_eq!(args[3], "example-host");
-        assert_eq!(args[4], "tmux -C attach -t 'dev; rm -rf /'");
+        assert_eq!(
+            args,
+            vec![
+                "-T",
+                "-p",
+                "2224",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=15",
+                "-o",
+                "ServerAliveInterval=30",
+                "-o",
+                "ServerAliveCountMax=3",
+                "example-host",
+                "tmux -C attach -t 'dev; rm -rf /'",
+            ]
+        );
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("tmux -C attach -t 'dev; rm -rf /'"),
+            "the remote command stays one argv element"
+        );
+    }
+
+    #[test]
+    fn target_validation_rejects_option_and_line_injection() {
+        let bad_host = Target::Ssh {
+            host: "-oProxyCommand=sh".into(),
+            socket: None,
+            session: "dev".into(),
+            ssh_options: Vec::new(),
+        };
+        assert_eq!(bad_host.validate(), Err(TargetError::InvalidHost));
+
+        let newline = Target::Local {
+            socket: None,
+            session: "dev\nkill-server".into(),
+        };
+        assert_eq!(newline.validate(), Err(TargetError::InvalidSession));
+
+        let empty_socket = Target::Local {
+            socket: Some(String::new()),
+            session: "dev".into(),
+        };
+        assert_eq!(empty_socket.validate(), Err(TargetError::InvalidSocket));
+
+        let ssh_with_nul = Target::Ssh {
+            host: "host".into(),
+            socket: None,
+            session: "dev".into(),
+            ssh_options: vec!["-o\u{0}x".into()],
+        };
+        assert_eq!(ssh_with_nul.validate(), Err(TargetError::InvalidSshOption));
+
+        assert!(Target::Ssh {
+            host: "user@example-host".into(),
+            socket: Some("my socket".into()),
+            session: "my session".into(),
+            ssh_options: vec!["-p".into(), "2224".into()],
+        }
+        .validate()
+        .is_ok());
     }
 
     #[test]
@@ -476,5 +688,30 @@ mod tests {
             transport.write_all(b"late command\n"),
             Err(TransportError::Closed)
         ));
+        // A second shutdown must not wait/kill the same child again.
+        transport.shutdown();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_write_is_still_reaped_on_shutdown() {
+        // The child closes its stdin and then sleeps.  Writing to the closed pipe
+        // fails and marks the transport closed; shutdown must still kill and wait,
+        // otherwise the process is left behind.
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exec 0<&-; sleep 30");
+        let mut transport =
+            ProcessTransport::spawn_command(command, "test-reap".to_string()).unwrap();
+        let pid = transport.pid();
+        std::thread::sleep(Duration::from_millis(300));
+        let write = transport.write_all(b"x");
+        assert!(write.is_err(), "the closed pipe must reject the write");
+        assert!(transport.is_closed());
+        transport.shutdown();
+        let proc_entry = format!("/proc/{pid}");
+        assert!(
+            !std::path::Path::new(&proc_entry).exists(),
+            "the child must have been reaped after a failed write"
+        );
     }
 }
