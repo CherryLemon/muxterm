@@ -25,12 +25,59 @@
 #![warn(clippy::all)]
 
 pub mod alacritty_core;
+pub mod input;
 pub mod snapshot;
 pub mod view;
 
 pub use alacritty_core::{AlacrittyCore, CoreListener, SideEffectCounts};
+pub use input::{
+    encode_focus, encode_mouse, encode_paste, Modifiers, MouseAction, MouseButton, MouseEvent,
+};
 pub use snapshot::{RestoreError, RestoreReport, ScreenSnapshot};
 pub use view::{CellFlags, CellView, Color, Cursor, CursorShape, LineView, Modes, ScreenView};
+
+/// A span of one viewport row that changed since the last damage report.
+///
+/// `left` and `right` are inclusive column indices.  Rows are relative to the
+/// viewport (row 0 is the top visible row), not to the scrollback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DamageLine {
+    /// Zero-based viewport row.
+    pub row: usize,
+    /// First damaged column, inclusive.
+    pub left: usize,
+    /// Last damaged column, inclusive.
+    pub right: usize,
+}
+
+/// What a renderer has to repaint after the last [`TerminalCore::take_damage`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Damage {
+    /// The whole viewport changed (or no finer information is available).
+    Full,
+    /// Only the listed line spans changed.
+    ///
+    /// An empty vector means "nothing changed": that is what a second
+    /// [`TerminalCore::take_damage`] returns when no input arrived in between.
+    Partial(Vec<DamageLine>),
+}
+
+impl Damage {
+    /// True when the whole viewport must be repainted.
+    #[must_use]
+    pub const fn is_full(&self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    /// The damaged spans, or an empty slice for [`Damage::Full`].
+    #[must_use]
+    pub fn lines(&self) -> &[DamageLine] {
+        match self {
+            Self::Full => &[],
+            Self::Partial(lines) => lines,
+        }
+    }
+}
 
 /// The boundary the rest of the product depends on.
 ///
@@ -42,6 +89,15 @@ pub trait TerminalCore {
 
     /// Resizes the grid.
     fn resize(&mut self, columns: u16, rows: u16);
+
+    /// Takes the viewport damage accumulated since the previous call.
+    ///
+    /// A renderer can repaint only the returned spans instead of the whole
+    /// screen.  The report is *drained*: calling this twice without feeding
+    /// anything in between returns an empty [`Damage::Partial`].  After a
+    /// [`TerminalCore::restore`] the report is [`Damage::Full`], because every
+    /// cell of the rebuilt screen is new.
+    fn take_damage(&mut self) -> Damage;
 
     /// Rebuilds the screen from a tmux snapshot.
     ///

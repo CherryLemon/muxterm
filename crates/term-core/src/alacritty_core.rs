@@ -18,12 +18,12 @@ use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Handler, Processor};
 
 use crate::snapshot::{RestoreError, RestoreReport, ScreenSnapshot};
 use crate::view::{Cursor, Modes, ScreenView};
-use crate::TerminalCore;
+use crate::{Damage, DamageLine, TerminalCore};
 
 /// Counters for everything the emulator asked for and this crate refused to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -166,6 +166,18 @@ pub struct AlacrittyCore {
     config: Config,
     columns: u16,
     rows: u16,
+    /// Whether an operation that can change the viewport happened since the last
+    /// damage report.  The emulator always reports the cursor cell as damaged,
+    /// even when nothing moved; this lets a repeated `take_damage` say "nothing
+    /// changed" instead of returning a one-cell report on every poll.
+    damage_pending: bool,
+    /// True until the first damage report or until the geometry/state is set from
+    /// outside (resize, restore).  The emulator starts fully damaged; if live input
+    /// arrives before the first report, the initial state is folded into an
+    /// all-rows partial report so the caller still receives line ranges.
+    initial_full: bool,
+    /// Whether live input arrived while `initial_full` was still set.
+    fed_since_start: bool,
 }
 
 impl AlacrittyCore {
@@ -194,6 +206,9 @@ impl AlacrittyCore {
             config,
             columns,
             rows,
+            damage_pending: true,
+            initial_full: true,
+            fed_since_start: false,
         }
     }
 
@@ -206,6 +221,10 @@ impl AlacrittyCore {
     /// Feeds bytes through the emulator's parser.
     fn feed_bytes(&mut self, bytes: &[u8]) {
         self.processor.advance(&mut self.term, bytes);
+        self.damage_pending = true;
+        if self.initial_full {
+            self.fed_since_start = true;
+        }
     }
 
     /// Feeds an ASCII control sequence written by this adapter.
@@ -245,6 +264,66 @@ impl TerminalCore for AlacrittyCore {
         });
         self.columns = columns;
         self.rows = rows;
+        // A resize reparses the grid layout; even when the emulator treats it as
+        // a no-op the next report has to repaint over the old geometry.
+        self.damage_pending = true;
+        self.initial_full = false;
+        self.fed_since_start = false;
+    }
+
+    fn take_damage(&mut self) -> Damage {
+        let damage = match self.term.damage() {
+            TermDamage::Full => Damage::Full,
+            TermDamage::Partial(lines) => Damage::Partial(
+                lines
+                    .map(|bounds| DamageLine {
+                        row: bounds.line,
+                        left: bounds.left,
+                        right: bounds.right,
+                    })
+                    .collect(),
+            ),
+        };
+
+        // The iterator borrows the terminal, so it has to be fully consumed (into
+        // the owned report above) before the damage state can be reset.
+        self.term.reset_damage();
+
+        // A brand-new core is fully damaged by construction.  If live input was
+        // fed before anyone asked for a report, express that state as one span
+        // per row: the caller still learns the full screen is new, and the rows
+        // the input touched are included.  Once the first report is taken, the
+        // normal partial reports apply.
+        let initial_full = std::mem::replace(&mut self.initial_full, false);
+        let fed_since_start = std::mem::replace(&mut self.fed_since_start, false);
+        let damage = if initial_full && fed_since_start && damage.is_full() {
+            let right = usize::from(self.columns).saturating_sub(1);
+            Damage::Partial(
+                (0..usize::from(self.rows))
+                    .map(|row| DamageLine {
+                        row,
+                        left: 0,
+                        right,
+                    })
+                    .collect(),
+            )
+        } else {
+            damage
+        };
+
+        // `Term::damage` always includes the cursor cell.  If nothing that could
+        // move the cursor or repaint the grid happened since the last report,
+        // that lone cell is all the emulator can report, and the honest answer is
+        // "no changes".
+        if self.damage_pending {
+            self.damage_pending = false;
+            damage
+        } else {
+            match damage {
+                Damage::Full => Damage::Full,
+                Damage::Partial(_) => Damage::Partial(Vec::new()),
+            }
+        }
     }
 
     fn restore(&mut self, snapshot: &ScreenSnapshot) -> Result<RestoreReport, RestoreError> {
@@ -258,6 +337,15 @@ impl TerminalCore for AlacrittyCore {
         // listener, so suppression cannot borrow the terminal we are painting into.
         let listener = self.listener.clone();
         let guard = listener.suppress();
+
+        // Start from a known state.  Without this, a second restore paints on top
+        // of the previous snapshot: the non-alternate path replays at whatever
+        // cursor was left behind, and the alternate path inherits modes (origin,
+        // application cursor, ...) from the screen being replaced.  RIS clears the
+        // grid, scrollback, scroll region, modes and cursor, and marks the whole
+        // screen damaged.  It goes through the regular processor while responses
+        // are suppressed, so anything it provokes is dropped and counted.
+        self.feed_bytes(b"\x1bc");
 
         self.resize(snapshot.columns, snapshot.rows);
 
@@ -289,8 +377,7 @@ impl TerminalCore for AlacrittyCore {
             for row in 0..usize::from(snapshot.rows) {
                 self.feed_control(&format!("\x1b[{};1H", row + 1));
                 if let Some(line) = visible.get(row) {
-                    let line = line.clone();
-                    self.feed_bytes(&line);
+                    self.feed_bytes(line);
                     report.lines_painted += 1;
                 }
                 self.feed_control("\x1b[K");
@@ -305,8 +392,7 @@ impl TerminalCore for AlacrittyCore {
                 if index > 0 {
                     self.feed_control("\r\n");
                 }
-                let line = line.clone();
-                self.feed_bytes(&line);
+                self.feed_bytes(line);
             }
             report.history_lines = snapshot.history_lines();
             report.lines_painted = visible.len();
@@ -356,5 +442,36 @@ impl TerminalCore for AlacrittyCore {
 
     fn side_effects(&self) -> SideEffectCounts {
         self.listener.effects()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alacritty_terminal::grid::Scroll;
+
+    #[test]
+    fn cursor_row_is_viewport_relative_when_scrolled_back() {
+        let mut core = AlacrittyCore::new(10, 3, 100);
+        for index in 0..10 {
+            core.feed(format!("line {index}\r\n").as_bytes());
+        }
+
+        let bottom = core.cursor();
+        assert!(bottom.visible);
+        assert_eq!(bottom.row, 2, "the cursor sits on the bottom viewport row");
+
+        core.term.scroll_display(Scroll::Delta(1));
+        let one_back = core.cursor();
+        assert!(one_back.visible);
+        assert_eq!(one_back.row, 1, "scrolling back moves the cursor row up");
+
+        core.term.scroll_display(Scroll::Delta(2));
+        let out_of_view = core.cursor();
+        assert!(
+            !out_of_view.visible,
+            "a cursor above the viewport is hidden"
+        );
+        assert_eq!(out_of_view.row, 0, "the row is clamped to the nearest edge");
     }
 }
