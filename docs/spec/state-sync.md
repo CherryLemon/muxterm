@@ -135,6 +135,10 @@ model) is not waiting for a full resync: the session runs a small
   "the mode changed" (tmux 3.4 sends the bare form on enter *and* leave); the model
   toggles it. Versions that send the mode name on enter are handled by the same
   rule.
+* **A pane moved between windows.** `%layout-change` updates the pane's window and
+  geometry, and `upsert_pane` removes it from the old window's list. Its
+  `pane_index`/title are only refreshed by `list-panes`, i.e. by a resync; the GUI
+  must not assume they are current immediately after a move.
 * **History continuity.** The client knows how many lines the server still has
   (`#{history_size}` / `#{history_limit}`) but cannot recover lines the server has
   already discarded, and must not claim to.

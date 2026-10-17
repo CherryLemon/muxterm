@@ -46,6 +46,11 @@ and, outside those blocks, single-line notifications that always start with `%`.
   `ONLCR` set. Since `%output` escapes every control byte, a CR immediately before
   the LF can only be that translation, so the parser removes exactly one trailing
   CR and keeps any other CR as data.
+  **[ours, residual]** The rule is transport-agnostic. It is exact for `%output`
+  and for any line on a PTY (a genuine CR there arrives as CR CR LF and survives).
+  On a pipe, a *response line* whose value genuinely ends in CR loses that byte.
+  Distinguishing the two needs the transport to tell the parser whether it has
+  `ONLCR`; the current `Transport` trait does not pass that down.
 
 ## 2. Notifications
 

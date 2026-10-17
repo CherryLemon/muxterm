@@ -24,7 +24,12 @@ Rules:
   literal;
 * a raw newline or carriage return is **refused** for general arguments
   (`CommandError::EmbeddedNewline`); `send_keys` handles text separately (below);
-* the encoded line is bounded by `Limits::max_encoded_command_bytes`.
+* the encoded line is bounded by `Limits::max_encoded_command_bytes`;
+* a value that is the **first positional** and starts with `-` can still be read
+  as a flag (`rename-window -x`). tmux stopped option parsing after the first
+  positional in the probes we ran, so only that shape is at risk; the encoder has
+  no `--` support, and callers should reject or normalize a leading `-` for
+  positional names.
 
 The encoder is the only place that assembles a command line; nothing concatenates
 user text into a command string.
