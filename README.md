@@ -21,7 +21,7 @@ screen-scraped TUI.
 | `crates/tmux-protocol` | byte-level control-mode parser, command encoder, command queue, `-CC` takeover switch, layout parser. **No I/O, no GUI, no dependencies.** | implemented; unit tests + 40 recorded captures replayed under every byte split |
 | `crates/tmux-client` | transports (local `tmux`, `ssh`), connection epochs, remote object model, snapshot/resync/incremental-capture engine, flow-control and size commands | implemented; unit tests plus scripted-transport session tests |
 | `crates/term-core` | terminal-emulation boundary: project-owned `TerminalCore` trait, read-only view types, idempotent snapshot restore, damage reporting, mouse/paste/focus encoders, side-effect isolation | implemented on `alacritty_terminal` 0.26 after passing the gate in `docs/adr/0002` |
-| `crates/poc-cli` | headless driver: `create`, `snapshot`, `stream`, `resize`, `mouse`, `reconnect`, `leak`, `core-gate`, `doctor` | implemented; all scenarios pass against a real tmux |
+| `crates/poc-cli` | headless driver: `create`, `snapshot`, `stream`, `resize`, `mouse`, `modes`, `reconnect`, `leak`, `core-gate`, `doctor` | implemented; all scenarios pass against a real tmux (3.3a, 3.4, 3.8) |
 
 Not started yet: renderer, GUI shell, tabs/splits UI, IME, settings, packaging.
 
