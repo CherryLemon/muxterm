@@ -36,7 +36,7 @@ use tmux_protocol::ids::{PaneId, SessionId, WindowId};
 use tmux_protocol::limits::Limits;
 use tmux_protocol::queue::Response;
 
-use crate::model::{ModelChange, PaneState, RemoteModel};
+use crate::model::{ModelChange, PaneModes, PaneState, RemoteModel};
 
 /// Which part of the snapshot a command belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -397,18 +397,7 @@ impl SyncEngine {
                     detail: format!("pane metadata {:?}", String::from_utf8_lossy(first)),
                 })?;
                 if let Some(state) = model.panes().get(&pane).cloned() {
-                    changes.push(model.upsert_pane(
-                        pane,
-                        PaneState {
-                            cursor: meta.cursor,
-                            alternate_on: meta.alternate_on,
-                            history_size: meta.history_size,
-                            history_limit: meta.history_limit,
-                            in_mode: meta.in_mode || state.in_mode,
-                            mode: meta.mode.or(state.mode),
-                            ..state
-                        },
-                    ));
+                    changes.push(model.upsert_pane(pane, apply_meta(&state, &meta)));
                 }
                 self.meta_seen.insert(pane);
             }
@@ -467,9 +456,20 @@ pub const WINDOW_FORMAT: &str = "#{session_id} #{window_id} #{window_index} \
 pub const PANE_FORMAT: &str = "#{window_id} #{pane_id} #{pane_index} #{pane_width} #{pane_height} \
      #{pane_active} #{pane_dead} #{pane_in_mode} #{pane_title}";
 /// Per-pane metadata query.
-pub const PANE_META_FORMAT: &str =
-    "#{cursor_x} #{cursor_y} #{alternate_on} #{history_size} #{history_limit} #{pane_in_mode} \
-     #{pane_mode} #{pane_dead}";
+///
+/// Order matters and is *not* the obvious one:
+///
+/// * the mode flags come **before** `#{pane_mode}` because that field is the only
+///   variable-length one (a mode line may carry arguments) and is therefore last;
+/// * `#{bracket_paste_flag}` is second to last because tmux before 3.7 expands it
+///   to the empty string, which the parser maps to "unknown";
+/// * every other field is a fixed `0`/`1`/number that a supported release always
+///   prints (3.3a and later).
+pub const PANE_META_FORMAT: &str = "#{cursor_x} #{cursor_y} #{alternate_on} #{history_size} \
+     #{history_limit} #{pane_in_mode} #{pane_dead} #{mouse_any_flag} #{mouse_standard_flag} \
+     #{mouse_button_flag} #{mouse_all_flag} #{mouse_sgr_flag} #{keypad_cursor_flag} \
+     #{keypad_flag} #{cursor_flag} #{insert_flag} #{origin_flag} #{wrap_flag} \
+     #{bracket_paste_flag} #{pane_mode}";
 
 /// The capture command used for the snapshot.
 ///
@@ -582,10 +582,35 @@ pub struct PaneMeta {
     pub history_limit: u32,
     /// True while in a tmux mode.
     pub in_mode: bool,
-    /// Mode name, when reported.
-    pub mode: Option<Vec<u8>>,
     /// True when the pane's process exited.
     pub dead: bool,
+    /// Application input modes the pane's program switched on.
+    pub modes: PaneModes,
+    /// Mode name, when reported.
+    pub mode: Option<Vec<u8>>,
+}
+
+/// Folds a metadata response into the pane state the model already has.
+///
+/// Kept next to the parser so the refresh path and the snapshot path cannot drift:
+/// both get the same fields from the same query.
+pub(crate) fn apply_meta(state: &PaneState, meta: &PaneMeta) -> PaneState {
+    PaneState {
+        cursor: meta.cursor,
+        alternate_on: meta.alternate_on,
+        history_size: meta.history_size,
+        history_limit: meta.history_limit,
+        // The notification path sets these too, and only ever turns them on: a
+        // metadata response may lag a `%pane-mode-changed`, and dropping back to
+        // "not in a mode" because a query raced the notification would hide copy
+        // mode from the UI.
+        in_mode: meta.in_mode || state.in_mode,
+        mode: meta.mode.clone().or_else(|| state.mode.clone()),
+        // Modes are exact, not monotonic: turning bracketed paste off again is a
+        // normal thing for an application to do, so the response wins.
+        modes: Some(meta.modes),
+        ..state.clone()
+    }
 }
 
 fn split_bounded<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
@@ -613,6 +638,64 @@ fn parse_u32(bytes: &[u8]) -> Option<u32> {
 
 fn parse_flag(bytes: &[u8]) -> bool {
     bytes == b"1"
+}
+
+/// Parses a flag that a server may not report at all.
+///
+/// `1` is on, `0` is off, anything else — in practice the empty expansion of a
+/// format the running tmux does not know — is unknown.
+fn parse_optional_flag(bytes: &[u8]) -> Option<bool> {
+    match bytes {
+        b"1" => Some(true),
+        b"0" => Some(false),
+        _ => None,
+    }
+}
+
+/// Reads space-separated fields left to right, in [`PANE_META_FORMAT`] order.
+///
+/// [`split_bounded`] is strict because a short line means a *different* answer than
+/// the one that was asked for.  Metadata is the one place where a field may
+/// legitimately be empty — `#{bracket_paste_flag}` before tmux 3.7, an empty
+/// `#{pane_mode}` — and a formatter may trim the trailing separator, so running out
+/// of separators reads as empty instead of rejecting the row.
+struct Fields<'a> {
+    rest: &'a [u8],
+}
+
+impl<'a> Fields<'a> {
+    const fn new(line: &'a [u8]) -> Self {
+        Self { rest: line }
+    }
+
+    /// The next field, or an empty slice once the line is exhausted.
+    fn next(&mut self) -> &'a [u8] {
+        match self.rest.iter().position(|b| *b == b' ') {
+            Some(index) => {
+                let field = &self.rest[..index];
+                self.rest = &self.rest[index + 1..];
+                field
+            }
+            None => std::mem::take(&mut self.rest),
+        }
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        parse_u32(self.next())
+    }
+
+    fn flag(&mut self) -> bool {
+        parse_flag(self.next())
+    }
+
+    fn optional_flag(&mut self) -> Option<bool> {
+        parse_optional_flag(self.next())
+    }
+
+    /// Everything that is left, separators included: the free-form last field.
+    const fn remainder(self) -> &'a [u8] {
+        self.rest
+    }
 }
 
 /// Parses one `list-sessions` line.
@@ -662,20 +745,42 @@ pub fn parse_pane_line(line: &[u8]) -> Option<PaneRow> {
 }
 
 /// Parses one pane metadata line.
+///
+/// The line has 19 fixed fields followed by the free-form `#{pane_mode}`; see
+/// [`PANE_META_FORMAT`] for why that order is what it is.
 #[must_use]
 pub fn parse_pane_meta(line: &[u8]) -> Option<PaneMeta> {
-    let parts: Vec<&[u8]> = line.split(|b| *b == b' ').collect();
-    if parts.len() < 8 {
-        return None;
-    }
+    let mut fields = Fields::new(line);
+    let cursor = (fields.u32()?, fields.u32()?);
+    let alternate_on = fields.flag();
+    let history_size = fields.u32()?;
+    let history_limit = fields.u32()?;
+    let in_mode = fields.flag();
+    let dead = fields.flag();
+    let modes = PaneModes {
+        mouse_any: fields.flag(),
+        mouse_click: fields.flag(),
+        mouse_drag: fields.flag(),
+        mouse_motion: fields.flag(),
+        mouse_sgr: fields.flag(),
+        application_cursor: fields.flag(),
+        application_keypad: fields.flag(),
+        show_cursor: fields.flag(),
+        insert: fields.flag(),
+        origin: fields.flag(),
+        line_wrap: fields.flag(),
+        bracketed_paste: fields.optional_flag(),
+    };
+    let mode = fields.remainder();
     Some(PaneMeta {
-        cursor: (parse_u32(parts[0])?, parse_u32(parts[1])?),
-        alternate_on: parse_flag(parts[2]),
-        history_size: parse_u32(parts[3])?,
-        history_limit: parse_u32(parts[4])?,
-        in_mode: parse_flag(parts[5]),
-        mode: (!parts[6].is_empty()).then(|| parts[6].to_vec()),
-        dead: parse_flag(parts[7]),
+        cursor,
+        alternate_on,
+        history_size,
+        history_limit,
+        in_mode,
+        dead,
+        modes,
+        mode: (!mode.is_empty()).then(|| mode.to_vec()),
     })
 }
 
@@ -744,15 +849,119 @@ mod tests {
         assert_eq!(row.title, "中 文 title".as_bytes());
     }
 
+    /// The 19 fixed metadata fields, in [`PANE_META_FORMAT`] order.
+    ///
+    /// A line is assembled from this array instead of typed out, so a test that
+    /// changes one field cannot silently shift the others.
+    const FLAGS: [&str; 19] = [
+        "12", "5", // cursor_x, cursor_y
+        "1", // alternate_on
+        "300", "2000", // history_size, history_limit
+        "1", "0", // pane_in_mode, pane_dead
+        "1", "0", "1", "0",
+        "1", // mouse_any, mouse_standard, mouse_button, mouse_all, mouse_sgr
+        "1", "0", // keypad_cursor_flag (DECCKM), keypad_flag (DECKPAM)
+        "1", "0", "1", "0", // cursor_flag, insert_flag, origin_flag, wrap_flag
+        "1", // bracket_paste_flag
+    ];
+
+    fn meta_line(flags: &[&str; 19], mode: &str) -> Vec<u8> {
+        let mut line = flags.join(" ");
+        if !mode.is_empty() {
+            line.push(' ');
+            line.push_str(mode);
+        }
+        line.into_bytes()
+    }
+
     #[test]
     fn parses_pane_metadata() {
-        let meta = parse_pane_meta(b"12 5 1 300 2000 1 copy-mode 0").unwrap();
+        let line = meta_line(&FLAGS, "copy-mode");
+        let meta = parse_pane_meta(&line).unwrap();
         assert_eq!(meta.cursor, (12, 5));
         assert!(meta.alternate_on);
         assert_eq!(meta.history_size, 300);
         assert_eq!(meta.history_limit, 2000);
         assert!(meta.in_mode);
+        assert!(!meta.dead);
         assert_eq!(meta.mode.as_deref(), Some(&b"copy-mode"[..]));
+    }
+
+    #[test]
+    fn parses_the_pane_mode_flags_one_by_one() {
+        let line = meta_line(&FLAGS, "copy-mode");
+        let modes = parse_pane_meta(&line).unwrap().modes;
+        assert!(modes.mouse_any);
+        assert!(!modes.mouse_click);
+        assert!(modes.mouse_drag);
+        assert!(!modes.mouse_motion);
+        assert!(modes.mouse_sgr);
+        assert!(modes.application_cursor);
+        assert!(!modes.application_keypad);
+        assert!(modes.show_cursor);
+        assert!(!modes.insert);
+        assert!(modes.origin);
+        assert!(!modes.line_wrap);
+        assert_eq!(modes.bracketed_paste, Some(true));
+    }
+
+    #[test]
+    fn a_pane_mode_with_spaces_does_not_shift_the_pane_dead_flag() {
+        // `#{pane_mode}` is last precisely so a mode string with arguments cannot
+        // move every field after it, which the previous field order allowed.
+        let mut flags = FLAGS;
+        flags[6] = "1"; // pane_dead, directly before the mode flags
+        let meta = parse_pane_meta(&meta_line(&flags, "copy-mode -H -u")).unwrap();
+        assert!(meta.dead);
+        assert!(meta.in_mode);
+        assert_eq!(meta.mode.as_deref(), Some(&b"copy-mode -H -u"[..]));
+    }
+
+    #[test]
+    fn an_unreported_bracket_paste_flag_is_unknown_not_off() {
+        // tmux 3.4 expands `#{bracket_paste_flag}` to nothing and trims the
+        // separator before the empty `#{pane_mode}`, so the line ends 18 fields in.
+        let flags = FLAGS;
+        let line = flags[..18].join(" ").into_bytes();
+        let meta = parse_pane_meta(&line).expect("a missing trailing field is tolerated");
+        assert_eq!(meta.modes.bracketed_paste, None);
+        assert_eq!(meta.mode, None);
+        assert!(
+            meta.modes.origin,
+            "the fields before the missing one still parse"
+        );
+    }
+
+    #[test]
+    fn a_zero_bracket_paste_flag_is_reported_as_off() {
+        let mut flags = FLAGS;
+        flags[18] = "0";
+        let meta = parse_pane_meta(&meta_line(&flags, "")).unwrap();
+        assert_eq!(meta.modes.bracketed_paste, Some(false));
+        assert_eq!(meta.mode, None);
+    }
+
+    #[test]
+    fn apply_meta_keeps_the_mode_notification_state_and_replaces_the_flags() {
+        let mut state = PaneState {
+            in_mode: true,
+            mode: Some(b"copy-mode".to_vec()),
+            modes: Some(PaneModes {
+                bracketed_paste: Some(true),
+                ..PaneModes::default()
+            }),
+            ..PaneState::default()
+        };
+        let meta = parse_pane_meta(&meta_line(&FLAGS, "")).unwrap();
+        let updated = apply_meta(&state, &meta);
+        assert_eq!(updated.cursor, (12, 5));
+        // A metadata response may lag a `%pane-mode-changed`: it may confirm the
+        // mode, never cancel it.
+        assert!(updated.in_mode);
+        assert!(updated.modes.is_some_and(|modes| modes.mouse_drag));
+        // The flags themselves are exact: the response wins over what we had.
+        state.modes = None;
+        assert!(apply_meta(&state, &meta).modes.is_some());
     }
 
     #[test]

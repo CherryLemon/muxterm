@@ -37,6 +37,54 @@ impl Consistency {
     }
 }
 
+/// Application input modes a pane's program has switched on.
+///
+/// A `capture-pane` carries the *screen*, never the application state: an editor
+/// that asked for SGR mouse reports or application cursor keys looks identical to
+/// a shell that asked for nothing.  tmux does track those switches per pane and
+/// exposes most of them as `#{..._flag}` formats, which is what this type mirrors.
+///
+/// Two gaps are deliberate and must stay visible:
+///
+/// * [`Self::bracketed_paste`] is an `Option`: the `#{bracket_paste_flag}` format
+///   only exists from tmux 3.7, and an older server expands it to the empty
+///   string.  `None` means *the server did not say*, not *off*.
+/// * focus reporting (DECSET 1004) and UTF-8 mouse coordinates (DECSET 1005) have
+///   no format on any release up to 3.8, so they are absent from this struct
+///   rather than reported as `false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PaneModes {
+    /// `#{mouse_any_flag}`: *some* mouse mode is active.
+    ///
+    /// Diagnostic only. It also aggregates DECSET 1005, for which there is no
+    /// per-protocol flag, so it must not be used to decide how to encode a click.
+    pub mouse_any: bool,
+    /// `#{mouse_standard_flag}`: DECSET 1000, press/release reporting.
+    pub mouse_click: bool,
+    /// `#{mouse_button_flag}`: DECSET 1002, button-drag reporting.
+    pub mouse_drag: bool,
+    /// `#{mouse_all_flag}`: DECSET 1003, all-motion reporting.
+    pub mouse_motion: bool,
+    /// `#{mouse_sgr_flag}`: DECSET 1006, SGR coordinates. The encoding is
+    /// independent of which tracking mode is on.
+    pub mouse_sgr: bool,
+    /// `#{keypad_cursor_flag}`: DECCKM, `CSI ? 1 h`. Cursor keys send `SS3`.
+    pub application_cursor: bool,
+    /// `#{keypad_flag}`: DECKPAM, `ESC =`. The keypad sends application sequences.
+    pub application_keypad: bool,
+    /// `#{cursor_flag}`: DECSET 25, cursor visibility.
+    pub show_cursor: bool,
+    /// `#{insert_flag}`: IRM, `CSI 4 h`.
+    pub insert: bool,
+    /// `#{origin_flag}`: DECSET 6, origin mode.
+    pub origin: bool,
+    /// `#{wrap_flag}`: DECSET 7, automatic line wrapping.
+    pub line_wrap: bool,
+    /// `#{bracket_paste_flag}`: DECSET 2004, or `None` when the server is too old
+    /// to report it (before tmux 3.7).
+    pub bracketed_paste: Option<bool>,
+}
+
 /// One pane as far as the client knows it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PaneState {
@@ -66,6 +114,19 @@ pub struct PaneState {
     pub history_size: u32,
     /// Configured history limit.
     pub history_limit: u32,
+    /// Application input modes the pane's program switched on.
+    ///
+    /// `None` until a per-pane metadata response has been applied: defaulted modes
+    /// would be indistinguishable from "the server has not told us yet", and a
+    /// terminal restored from a guess encodes input the application cannot read
+    /// (a bracketed paste it never asked for, a click reported in the wrong
+    /// protocol).
+    ///
+    /// This is the state as of the last metadata response, refreshed by a snapshot
+    /// or a resync. tmux sends no notification when a program switches modes, so a
+    /// long-lived client must track live changes by feeding `%output` into its
+    /// terminal core and use this only to restore a screen it has no core for yet.
+    pub modes: Option<PaneModes>,
     /// False until the pane's screen snapshot has been loaded.
     ///
     /// Output that arrives before the snapshot is dropped on purpose: it is

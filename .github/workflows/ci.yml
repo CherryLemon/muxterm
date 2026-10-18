@@ -38,6 +38,7 @@ jobs:
           $POC stream --socket "$SOCKET" --seconds 2
           $POC resize --socket "$SOCKET"
           $POC mouse --socket "$SOCKET"
+          $POC modes --socket "$SOCKET"
           $POC reconnect --socket "$SOCKET" --detach-seconds 2
           $POC core-gate --socket "$SOCKET"
           $POC leak --socket "$SOCKET"

@@ -17,7 +17,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use term_core::input::{encode_mouse, Modifiers, MouseAction, MouseButton, MouseEvent};
-use term_core::Modes;
+use term_core::{AlacrittyCore, Modes, TerminalCore};
+use tmux_client::model::{PaneModes, PaneState};
 use tmux_client::session::{ControlSession, SessionEvent};
 use tmux_client::sync::SyncStats;
 use tmux_client::transport::Target;
@@ -753,6 +754,254 @@ pub fn mouse(tmux: &Tmux, session: &str) -> Result<Report, String> {
     control.close();
     tmux.run_ignoring_errors(&["kill-session", "-t", &probe_session]);
     let _ = std::fs::remove_file(&probe_file);
+    Ok(report)
+}
+
+/// The modes `tools/poc/app-modes.sh` switches on, in `PANE_META_FORMAT` order.
+///
+/// Kept as a string so the check compares exactly what tmux prints, not what this
+/// code believes it prints.
+const APP_MODE_FLAGS: &str = "#{mouse_any_flag} #{mouse_standard_flag} #{mouse_button_flag} \
+     #{mouse_all_flag} #{mouse_sgr_flag} #{keypad_cursor_flag} #{keypad_flag} #{cursor_flag} \
+     #{insert_flag} #{origin_flag} #{wrap_flag}";
+/// What that format must say for the probe application: 1002 + SGR, DECCKM, DECKPAM,
+/// cursor hidden, insert, origin, no wrapping.
+const APP_MODE_VALUES: &str = "1 0 1 0 1 1 1 0 1 1 0";
+
+/// Reads one pane's modes the way a client does: attach, snapshot, metadata.
+fn read_pane_modes(
+    tmux: &Tmux,
+    session: &str,
+) -> Result<(PaneId, PaneState, Vec<Vec<u8>>), String> {
+    let mut control = attach(tmux, session)?;
+    let events = control
+        .pump_until_synced(Duration::from_secs(20))
+        .map_err(|err| err.to_string())?;
+
+    let mut captured: BTreeMap<PaneId, Vec<Vec<u8>>> = BTreeMap::new();
+    for event in events {
+        match event {
+            SessionEvent::PaneSnapshot { pane, lines } => {
+                captured.insert(pane, lines);
+            }
+            SessionEvent::Desync { reason } => {
+                return Err(format!("desynchronised during the snapshot: {reason}"));
+            }
+            _ => {}
+        }
+    }
+
+    // The snapshot lists every pane on the server, so pick this session's pane
+    // instead of taking the first id that appears.
+    let listed = tmux
+        .run(&["list-panes", "-t", session, "-F", "#{pane_id}"])
+        .map_err(|err| err.to_string())?;
+    let pane = listed
+        .lines()
+        .find_map(|line| PaneId::from_wire(line.trim().as_bytes()))
+        .ok_or_else(|| format!("session {session} has no pane"))?;
+    let state = control
+        .model()
+        .panes()
+        .get(&pane)
+        .cloned()
+        .ok_or_else(|| format!("pane {pane} is missing from the model"))?;
+    let lines = captured.get(&pane).cloned().unwrap_or_default();
+    control.close();
+    Ok((pane, state, lines))
+}
+
+/// Proves that a pane application's input modes survive a reconnect.
+///
+/// The screen is only half of what a reconnect restores.  A program that asked for
+/// button-drag mouse reports, SGR coordinates and application cursor keys looks
+/// exactly like a shell on the captured screen, so a client that guessed would send
+/// a click as a selection, a paste as typing and an arrow key in the wrong
+/// encoding.  This scenario runs `tools/poc/app-modes.sh` — a stub full-screen
+/// program — and checks, against a real tmux server:
+///
+/// 1. tmux itself tracks the switches (precondition, checked through the formats);
+/// 2. the client's per-pane metadata reports them;
+/// 3. a second attach (the reconnect) reports the same modes;
+/// 4. a restore into the terminal core reproduces them, and the encoder then really
+///    produces an SGR mouse report;
+/// 5. modes no tmux release exposes are unknown, not invented.
+///
+/// # Errors
+///
+/// Returns a description when the probe session or the tmux queries fail.
+pub fn modes(tmux: &Tmux, session: &str) -> Result<Report, String> {
+    let mut report = Report::default();
+    let probe_session = format!("{session}-modes");
+    tmux.run_ignoring_errors(&["kill-session", "-t", &probe_session]);
+
+    let command = format!("sh {}", tmux_client::shell_quote(&poc_tool("app-modes.sh")));
+    tmux.run(&[
+        "new-session",
+        "-d",
+        "-s",
+        &probe_session,
+        "-x",
+        "80",
+        "-y",
+        "24",
+        &command,
+    ])
+    .map_err(|err| err.to_string())?;
+
+    // The application's switches have to reach tmux before a snapshot can see them.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut observed = String::new();
+    while Instant::now() < deadline {
+        observed = tmux
+            .run(&[
+                "display-message",
+                "-p",
+                "-t",
+                &probe_session,
+                APP_MODE_FLAGS,
+            ])
+            .map_err(|err| err.to_string())?;
+        if observed.trim() == APP_MODE_VALUES {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    report.check(
+        "tmux tracked the modes the pane application switched on",
+        observed.trim() == APP_MODE_VALUES,
+        format!(
+            "tmux reports {:?}, expected {:?}",
+            observed.trim(),
+            APP_MODE_VALUES
+        ),
+    );
+
+    // Capability detection, not a version comparison: before tmux 3.7 the format is
+    // unknown and expands to nothing.
+    let bracket_paste = tmux
+        .run(&[
+            "display-message",
+            "-p",
+            "-t",
+            &probe_session,
+            "#{bracket_paste_flag}",
+        ])
+        .map_err(|err| err.to_string())?;
+    let bracket_paste_supported = !bracket_paste.trim().is_empty();
+    let expected = PaneModes {
+        mouse_any: true,
+        mouse_click: false,
+        mouse_drag: true,
+        mouse_motion: false,
+        mouse_sgr: true,
+        application_cursor: true,
+        application_keypad: true,
+        show_cursor: false,
+        insert: true,
+        origin: true,
+        line_wrap: false,
+        bracketed_paste: bracket_paste_supported.then_some(true),
+    };
+
+    let (pane, first_state, lines) = read_pane_modes(tmux, &probe_session)?;
+    report.check(
+        "the per-pane metadata reports the application modes",
+        first_state.modes == Some(expected),
+        format!(
+            "pane {pane}: model {:?}, expected {expected:?}",
+            first_state.modes
+        ),
+    );
+    report.check(
+        "the aggregate mouse flag agrees with the specific ones",
+        first_state.modes.is_some_and(|modes| {
+            modes.mouse_any == (modes.mouse_click || modes.mouse_drag || modes.mouse_motion)
+        }),
+        format!("{:?}", first_state.modes),
+    );
+
+    // The reconnect: a fresh attach and a fresh snapshot, exactly what the UI does
+    // after the connection drops.
+    let (_, second_state, _) = read_pane_modes(tmux, &probe_session)?;
+    report.check(
+        "a reconnect reports the same modes",
+        second_state.modes == first_state.modes && second_state.modes.is_some(),
+        format!(
+            "first {:?}, second {:?}",
+            first_state.modes, second_state.modes
+        ),
+    );
+
+    let snapshot = crate::pane_modes::snapshot(&second_state, lines);
+    let mut core = AlacrittyCore::new(snapshot.columns.max(1), snapshot.rows.max(1), 1000);
+    let restore = core
+        .restore(&snapshot)
+        .map_err(|err| format!("restoring pane {pane} failed: {err}"))?;
+    let restored = core.modes();
+    report.check(
+        "the restore applied the modes instead of guessing",
+        restore.input_modes_applied,
+        format!("report: {restore:?}"),
+    );
+    report.check(
+        "mouse drag reporting is restored with SGR coordinates",
+        restored.mouse_drag
+            && restored.mouse_sgr
+            && !restored.mouse_click
+            && !restored.mouse_motion,
+        format!("{restored:?}"),
+    );
+    report.check(
+        "application cursor keys and the application keypad are restored",
+        restored.application_cursor && restored.application_keypad,
+        format!("{restored:?}"),
+    );
+    report.check(
+        "cursor visibility, insert mode, origin mode and wrapping are restored",
+        !restored.show_cursor && restored.insert && restored.origin && !restored.line_wrap,
+        format!(
+            "cursor visible={} (tmux cursor_flag={}), insert={}, origin={}, wrap={}",
+            restored.show_cursor,
+            expected.show_cursor,
+            restored.insert,
+            restored.origin,
+            restored.line_wrap
+        ),
+    );
+    report.check(
+        "a restored pane encodes a click as an SGR report, not as a selection",
+        encode_mouse(
+            &MouseEvent {
+                column: 10,
+                row: 5,
+                button: MouseButton::Left,
+                action: MouseAction::Press,
+                modifiers: Modifiers::default(),
+            },
+            &restored,
+        )
+        .is_some_and(|bytes| bytes.starts_with(b"\x1b[<0;11;6")),
+        format!("modes: {restored:?}"),
+    );
+    report.check(
+        "bracketed paste matches what the server can report",
+        restored.bracketed_paste == bracket_paste_supported,
+        format!(
+            "tmux reports the flag: {bracket_paste_supported}, restored: {} (unknown before tmux 3.7, not off)",
+            restored.bracketed_paste
+        ),
+    );
+    report.check(
+        "modes no tmux release reports stay unknown",
+        !restored.focus_events && !restored.mouse_utf8,
+        format!(
+            "focus_events={}, mouse_utf8={} (DECSET 1004/1005 have no pane format up to 3.8)",
+            restored.focus_events, restored.mouse_utf8
+        ),
+    );
+
+    tmux.run_ignoring_errors(&["kill-session", "-t", &probe_session]);
     Ok(report)
 }
 

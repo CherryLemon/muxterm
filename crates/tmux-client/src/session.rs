@@ -39,10 +39,10 @@ use tmux_protocol::switch::{SwitchAction, TakeoverSwitch};
 use tmux_protocol::SYNC_MARKER;
 
 use crate::epoch::ConnectionEpoch;
-use crate::model::{ModelChange, PaneState, RemoteModel};
+use crate::model::{ModelChange, RemoteModel};
 use crate::sync::{
-    capture_command, meta_command, parse_pane_meta, SyncEngine, SyncError, SyncOutcome, SyncStats,
-    Tag,
+    apply_meta, capture_command, meta_command, parse_pane_meta, SyncEngine, SyncError, SyncOutcome,
+    SyncStats, Tag,
 };
 use crate::transport::{ProcessTransport, Target, TargetError, Transport, TransportError};
 
@@ -964,18 +964,7 @@ impl ControlSession {
             return Ok(());
         };
         if let Some(state) = self.model.panes().get(&pane).cloned() {
-            let change = self.model.upsert_pane(
-                pane,
-                PaneState {
-                    cursor: meta.cursor,
-                    alternate_on: meta.alternate_on,
-                    history_size: meta.history_size,
-                    history_limit: meta.history_limit,
-                    in_mode: meta.in_mode || state.in_mode,
-                    mode: meta.mode.or(state.mode),
-                    ..state
-                },
-            );
+            let change = self.model.upsert_pane(pane, apply_meta(&state, &meta));
             events.push(SessionEvent::Model(change));
         }
         let change = self.model.mark_pane_ready(pane);

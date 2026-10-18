@@ -52,7 +52,7 @@ volumes. See [`docs/dev-environment.md`](docs/dev-environment.md).
 ### The PoC scenarios
 
 ```bash
-tools/container/e2e.sh   # create, snapshot, stream, resize, mouse, reconnect, core-gate, leak
+tools/container/e2e.sh   # create, snapshot, stream, resize, mouse, modes, reconnect, core-gate, leak
 ```
 
 or step by step:
@@ -64,6 +64,7 @@ tools/container/run.sh bash -lc '
   ./target/debug/poc snapshot  --socket poc &&
   ./target/debug/poc resize    --socket poc &&
   ./target/debug/poc mouse     --socket poc &&
+  ./target/debug/poc modes     --socket poc &&
   ./target/debug/poc reconnect --socket poc --detach-seconds 3 &&
   ./target/debug/poc core-gate --socket poc &&
   ./target/debug/poc leak      --socket poc &&
@@ -76,7 +77,10 @@ output continues in order.  `core-gate` proves that the terminal core rebuilds w
 tmux says a pane shows — text cell by cell, plus cursor, alternate screen and
 scrollback — and that restore is idempotent.  `resize` announces a new client size
 and checks that tmux and the model agree.  `mouse` sends an SGR report through
-`send-keys -H` and reads it back from a pane application byte-for-byte.  `leak`
+`send-keys -H` and reads it back from a pane application byte-for-byte.  `modes`
+reattaches to a pane application that asked for SGR mouse reports, application
+cursor keys and bracketed paste, and checks that the modes tmux reports survive
+the reconnect and reach the input encoder.  `leak`
 runs `tmux -CC` inside a real shell on a real PTY and proves that no control
 command reaches the shell after control mode ends; `--inject-bug` deliberately
 breaks that rule and the same detector must catch it.

@@ -21,7 +21,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Handler, Processor};
 
-use crate::snapshot::{RestoreError, RestoreReport, ScreenSnapshot};
+use crate::snapshot::{InputModes, RestoreError, RestoreReport, ScreenSnapshot};
 use crate::view::{Cursor, Modes, ScreenView};
 use crate::{Damage, DamageLine, TerminalCore};
 
@@ -112,6 +112,11 @@ impl CoreListener {
             Event::Title(_) | Event::ResetTitle => state.effects.title += 1,
             Event::ColorRequest(..) => state.effects.color_request += 1,
             Event::TextAreaSizeRequest(_) => state.effects.size_request += 1,
+            // Redraw hints for a GUI, not requests to the outside world.  A restore
+            // that switches on mouse reporting provokes `MouseCursorDirty`, and
+            // counting that as a refused side effect would make every reattach look
+            // like it tried to do something.
+            Event::MouseCursorDirty | Event::CursorBlinkingChange => {}
             _ => state.effects.other += 1,
         });
     }
@@ -235,6 +240,46 @@ impl AlacrittyCore {
     /// Moves the cursor explicitly, outside the byte stream.
     fn set_cursor(&mut self, column: u16, row: u16) {
         self.term.goto(i32::from(row), usize::from(column));
+    }
+
+    /// Switches on the application input modes a snapshot reported.
+    ///
+    /// Only *on* switches are emitted: the restore starts from RIS, so everything
+    /// the snapshot did not ask for is already at the emulator default.  That also
+    /// keeps the function idempotent, which a restore has to be.
+    ///
+    /// Mouse tracking is mutually exclusive in both tmux and the emulator, so the
+    /// three tracking modes are applied in ascending order: a server that reports
+    /// several (it should not) leaves the most permissive one on, which is what an
+    /// application that enabled them in that order would have ended up with.
+    fn apply_input_modes(&mut self, modes: &InputModes) {
+        let switches: [(&str, bool); 8] = [
+            ("\x1b[?1000h", modes.mouse_click),
+            ("\x1b[?1002h", modes.mouse_drag),
+            ("\x1b[?1003h", modes.mouse_motion),
+            ("\x1b[?1006h", modes.mouse_sgr),
+            ("\x1b[?1h", modes.application_cursor),
+            ("\x1b=", modes.application_keypad),
+            ("\x1b[4h", modes.insert),
+            ("\x1b[?6h", modes.origin),
+        ];
+        for (sequence, enabled) in switches {
+            if enabled {
+                self.feed_control(sequence);
+            }
+        }
+        // These two default to *on*, so they are the only resets a restore has to
+        // emit.
+        if !modes.show_cursor {
+            self.feed_control("\x1b[?25l");
+        }
+        if !modes.line_wrap {
+            self.feed_control("\x1b[?7l");
+        }
+        // `None` (a tmux older than 3.7) is not "off": leave the default alone.
+        if modes.bracketed_paste == Some(true) {
+            self.feed_control("\x1b[?2004h");
+        }
     }
 
     /// Current cursor, taken from the emulator rather than from our own bookkeeping.
@@ -404,6 +449,21 @@ impl TerminalCore for AlacrittyCore {
             }
         }
 
+        // Application input modes, after the paint and before the cursor:
+        //
+        // * after the paint, because insert mode would shift every line fed
+        //   through it and origin mode would move the cursor to the home position
+        //   mid-repaint;
+        // * before the cursor, because setting origin mode homes the cursor, and
+        //   the pane's reported cursor position is the one that must win.
+        //
+        // RIS above reset every mode to the emulator default, so only the *on*
+        // switches have to be emitted: a mode tmux reports as off is already off.
+        if let Some(modes) = &snapshot.input_modes {
+            self.apply_input_modes(modes);
+            report.input_modes_applied = true;
+        }
+
         // Cursor last: painting moved it.
         let (column, row) = snapshot.cursor;
         self.set_cursor(column, row);
@@ -473,5 +533,119 @@ mod tests {
             "a cursor above the viewport is hidden"
         );
         assert_eq!(out_of_view.row, 0, "the row is clamped to the nearest edge");
+    }
+
+    /// A snapshot of an 80x24 pane whose program asked for everything the server
+    /// can report except the two modes no tmux release exposes.
+    fn modes_snapshot() -> ScreenSnapshot {
+        let mut snapshot = ScreenSnapshot::new(80, 24, vec![b"screen".to_vec()]);
+        snapshot.cursor = (7, 3);
+        snapshot.input_modes = Some(InputModes {
+            mouse_click: false,
+            mouse_drag: true,
+            mouse_motion: false,
+            mouse_sgr: true,
+            application_cursor: true,
+            application_keypad: true,
+            show_cursor: false,
+            insert: true,
+            origin: true,
+            line_wrap: false,
+            bracketed_paste: Some(true),
+        });
+        snapshot
+    }
+
+    #[test]
+    fn restore_applies_the_reported_input_modes() {
+        let snapshot = modes_snapshot();
+        let mut core = AlacrittyCore::new(80, 24, 100);
+        let report = core.restore(&snapshot).expect("restore succeeds");
+
+        assert!(report.input_modes_applied);
+        let modes = core.modes();
+        assert!(modes.mouse_drag, "DECSET 1002");
+        assert!(!modes.mouse_click, "1000 was reported off");
+        assert!(!modes.mouse_motion, "1003 was reported off");
+        assert!(modes.mouse_sgr, "DECSET 1006");
+        assert!(modes.mouse_reporting);
+        assert!(modes.application_cursor, "DECCKM");
+        assert!(modes.application_keypad, "DECKPAM");
+        assert!(modes.insert, "IRM is a non-private mode");
+        assert!(modes.origin, "DECSET 6");
+        assert!(!modes.line_wrap, "DECSET 7 off");
+        assert!(!modes.show_cursor, "DECSET 25 off");
+        assert!(!core.cursor().visible, "the cursor view follows the mode");
+        assert!(modes.bracketed_paste, "DECSET 2004");
+        // The two modes no tmux release reports must stay unknown, i.e. off.
+        assert!(!modes.focus_events);
+        assert!(!modes.mouse_utf8);
+        // Switching modes makes the emulator ask for a redraw, not for anything the
+        // client would have to refuse.
+        let effects = core.side_effects();
+        assert_eq!(effects.other, 0, "unexpected side effects: {effects:?}");
+    }
+
+    #[test]
+    fn the_reported_cursor_wins_over_origin_mode_homing() {
+        // Setting origin mode homes the cursor, so a restore that applied the modes
+        // after positioning it would put every restored pane's cursor at 0,0.
+        let snapshot = modes_snapshot();
+        let mut core = AlacrittyCore::new(80, 24, 100);
+        core.restore(&snapshot).expect("restore succeeds");
+        let cursor = core.cursor();
+        assert_eq!((cursor.column, cursor.row), (7, 3));
+    }
+
+    #[test]
+    fn restore_without_metadata_keeps_the_emulator_defaults() {
+        let mut snapshot = ScreenSnapshot::new(10, 2, vec![b"x".to_vec()]);
+        snapshot.cursor = (1, 1);
+        let mut core = AlacrittyCore::new(10, 2, 100);
+        // Leave a different mode set behind, so "did nothing" is visible.
+        core.feed(b"\x1b[?1002h\x1b[?6h\x1b=\x1b[?25l");
+        let report = core.restore(&snapshot).expect("restore succeeds");
+        assert!(!report.input_modes_applied);
+        let modes = core.modes();
+        assert!(!modes.mouse_reporting);
+        assert!(!modes.application_cursor);
+        assert!(!modes.application_keypad);
+        assert!(!modes.origin);
+        assert!(modes.show_cursor);
+        assert!(modes.line_wrap);
+        assert!(!modes.bracketed_paste);
+    }
+
+    #[test]
+    fn an_unreported_bracketed_paste_is_not_guessed() {
+        // Before tmux 3.7 the flag expands to nothing. Turning it on "just in case"
+        // would make the client send `CSI 200 ~` to an application that never asked
+        // for it, which is worse than not using bracketed paste.
+        let mut snapshot = ScreenSnapshot::new(10, 2, vec![b"x".to_vec()]);
+        snapshot.input_modes = Some(InputModes {
+            bracketed_paste: None,
+            ..InputModes::default()
+        });
+        let mut core = AlacrittyCore::new(10, 2, 100);
+        core.restore(&snapshot).expect("restore succeeds");
+        assert!(!core.modes().bracketed_paste);
+    }
+
+    #[test]
+    fn restore_is_idempotent_for_input_modes() {
+        let snapshot = modes_snapshot();
+        let mut core = AlacrittyCore::new(80, 24, 100);
+        core.restore(&snapshot).expect("restore succeeds");
+        let expected = core.modes();
+
+        // A second core left in the opposite state, then restored from the same
+        // snapshot: RIS must clear what the previous state had on, and the snapshot
+        // must turn back on what it reports.
+        let mut reused = AlacrittyCore::new(80, 24, 100);
+        reused.feed(b"\x1b[?1000h\x1b[?1003h\x1b[?1006h\x1b[?7h\x1b[?25h\x1b[>4h");
+        assert!(reused.modes().mouse_motion);
+        reused.restore(&snapshot).expect("restore succeeds");
+        assert_eq!(reused.modes(), expected);
+        assert_eq!(reused.cursor(), core.cursor());
     }
 }

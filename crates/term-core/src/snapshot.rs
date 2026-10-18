@@ -5,6 +5,55 @@
 //! metadata queries in `tmux_client::sync`, and this module is where the two are
 //! joined.
 
+/// The input modes a restore can reproduce.
+///
+/// A `capture-pane` carries cells, not application state: without this, a
+/// reattached client thinks an editor is a shell, encodes a click as a keystroke
+/// and a paste as typing, and the application either ignores the input or paints
+/// garbage.  tmux exposes most of the relevant switches per pane, and this is the
+/// subset a restore can apply.
+///
+/// Two modes are **absent on purpose**, because no tmux release up to 3.8 reports
+/// them: focus in/out (DECSET 1004) and UTF-8 mouse coordinates (DECSET 1005).
+/// They are unknown, not off — a caller must not send focus events or UTF-8 clicks
+/// on the strength of this struct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InputModes {
+    /// Left/middle/right press and release are reported (DECSET 1000).
+    pub mouse_click: bool,
+    /// Drags with a held button are reported (DECSET 1002).
+    pub mouse_drag: bool,
+    /// Every motion is reported (DECSET 1003).
+    pub mouse_motion: bool,
+    /// Reports use SGR coordinates (DECSET 1006).
+    pub mouse_sgr: bool,
+    /// Cursor keys send application sequences (DECCKM, `CSI ? 1 h`).
+    pub application_cursor: bool,
+    /// The keypad sends application sequences (DECKPAM, `ESC =`).
+    pub application_keypad: bool,
+    /// The cursor is visible (DECSET 25).
+    pub show_cursor: bool,
+    /// Insert mode (IRM, `CSI 4 h`).
+    pub insert: bool,
+    /// Origin mode (DECSET 6).
+    pub origin: bool,
+    /// Automatic line wrapping (DECSET 7).
+    pub line_wrap: bool,
+    /// Bracketed paste (DECSET 2004), or `None` when the server cannot report it
+    /// (tmux before 3.7).  `None` means *unknown*, so a restore must leave the
+    /// emulator's default alone rather than guess.
+    pub bracketed_paste: Option<bool>,
+}
+
+impl InputModes {
+    /// True when some mouse tracking mode is on, i.e. when a click should be
+    /// encoded instead of being turned into a selection.
+    #[must_use]
+    pub const fn mouse_reporting(&self) -> bool {
+        self.mouse_click || self.mouse_drag || self.mouse_motion
+    }
+}
+
 /// Everything needed to make an emulator show what a pane is showing.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ScreenSnapshot {
@@ -29,6 +78,11 @@ pub struct ScreenSnapshot {
     pub mode_name: Option<Vec<u8>>,
     /// True when the pane's process has exited.
     pub dead: bool,
+    /// Application input modes, when the server reported them.
+    ///
+    /// `None` is not "all off": it means the caller had no metadata for this pane,
+    /// and a restore then leaves the emulator defaults in place.
+    pub input_modes: Option<InputModes>,
 }
 
 impl ScreenSnapshot {
@@ -119,6 +173,8 @@ pub struct RestoreReport {
     /// True when the pane is on the alternate screen, so the scrollback is not
     /// meaningful.
     pub alternate_screen: bool,
+    /// Whether the snapshot's application input modes were applied.
+    pub input_modes_applied: bool,
 }
 
 #[cfg(test)]

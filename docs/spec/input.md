@@ -54,10 +54,30 @@ The caller sends the bytes with `ControlSession::send_bytes`, which uses
   so it can be tested without a window.
 * `encode_focus(focused, modes)`: `CSI I` / `CSI O` only when DECSET 1004 is on.
 
-## 4. What is *not* restored
+## 4. What a reconnect restores, and what stays unknown
 
-The pane's *application* modes (bracketed paste, mouse reporting, application
-cursor keys, focus reporting) live inside the remote program. A reconnect can
-restore the screen but cannot set those modes; see
-[`state-sync.md`](state-sync.md) §5. The GUI must therefore treat the modes from
-its own terminal core as current only after the application has drawn again.
+The application modes live inside the remote program, and `capture-pane` cannot
+carry them. tmux does track most of them per pane, so the per-pane metadata query
+is turned into `term_core::InputModes` and applied by `TerminalCore::restore`:
+
+| mode | tmux format | restored |
+|---|---|---|
+| DECSET 1000 / 1002 / 1003 mouse tracking | `#{mouse_standard_flag}`, `#{mouse_button_flag}`, `#{mouse_all_flag}` | yes |
+| DECSET 1006 SGR coordinates | `#{mouse_sgr_flag}` | yes |
+| DECCKM / DECKPAM | `#{keypad_cursor_flag}`, `#{keypad_flag}` | yes |
+| DECSET 25 cursor visibility | `#{cursor_flag}` | yes |
+| IRM insert mode (`CSI 4 h`) | `#{insert_flag}` | yes |
+| DECSET 6 origin, DECSET 7 wrap | `#{origin_flag}`, `#{wrap_flag}` | yes |
+| DECSET 2004 bracketed paste | `#{bracket_paste_flag}` | from tmux 3.7; older servers report nothing (§5) |
+| DECSET 1004 focus, DECSET 1005 UTF-8 mouse | — | **no**: unknown on every release up to 3.8 |
+
+"Unknown" is a value, not a default: `InputModes::bracketed_paste` is an `Option`
+and `None` means the server could not say, so `encode_paste` must be called with
+`bracketed = false`; focus and UTF-8 mouse are absent from the struct entirely, so
+a caller cannot accidentally treat them as "off" and start sending reports the
+application never asked for. `poc modes` verifies the whole path — tmux, metadata,
+model, restore, encoder — against a real server.
+
+The screen is restored before the modes, and the cursor after them: applying origin
+mode homes the cursor, so a restore that set the modes last would put every
+reattached pane's cursor at the top-left corner.

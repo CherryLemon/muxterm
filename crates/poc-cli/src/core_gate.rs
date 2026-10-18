@@ -19,12 +19,13 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use term_core::{AlacrittyCore, ScreenSnapshot, TerminalCore};
+use term_core::{AlacrittyCore, TerminalCore};
 use tmux_client::session::{ControlSession, SessionEvent};
 use tmux_client::transport::Target;
 use tmux_protocol::ids::PaneId;
 use tmux_protocol::limits::Limits;
 
+use crate::pane_modes;
 use crate::scenarios::Report;
 use crate::tmux::Tmux;
 
@@ -113,18 +114,9 @@ pub fn run(tmux: &Tmux, session: &str) -> Result<(Report, Vec<PaneEvidence>), St
             continue;
         };
 
-        let columns = u16::try_from(state.width).unwrap_or(u16::MAX);
-        let rows = u16::try_from(state.height).unwrap_or(u16::MAX);
-        let mut snapshot = ScreenSnapshot::new(columns, rows, lines);
-        snapshot.cursor = (
-            u16::try_from(state.cursor.0).unwrap_or(u16::MAX),
-            u16::try_from(state.cursor.1).unwrap_or(u16::MAX),
-        );
-        snapshot.alternate_on = state.alternate_on;
-        snapshot.history_size = state.history_size;
-        snapshot.history_limit = state.history_limit;
-        snapshot.in_mode = state.in_mode;
-        snapshot.dead = state.dead;
+        let snapshot = pane_modes::snapshot(&state, lines);
+        let columns = snapshot.columns;
+        let rows = snapshot.rows;
 
         let mut core = AlacrittyCore::new(
             columns,
@@ -248,21 +240,10 @@ pub fn run(tmux: &Tmux, session: &str) -> Result<(Report, Vec<PaneEvidence>), St
             let Some(state) = session_ctl.model().panes().get(pane).cloned() else {
                 continue;
             };
-            let mut snapshot = ScreenSnapshot::new(
-                u16::try_from(state.width).unwrap_or(80),
-                u16::try_from(state.height).unwrap_or(24),
-                lines.clone(),
-            );
-            snapshot.cursor = (
-                u16::try_from(state.cursor.0).unwrap_or(0),
-                u16::try_from(state.cursor.1).unwrap_or(0),
-            );
-            snapshot.alternate_on = state.alternate_on;
-            let mut core = AlacrittyCore::new(
-                u16::try_from(state.width).unwrap_or(80),
-                u16::try_from(state.height).unwrap_or(24),
-                1000,
-            );
+            let snapshot = pane_modes::snapshot(&state, lines.clone());
+            // The core and the snapshot must agree on the geometry, so both come
+            // from the snapshot.
+            let mut core = AlacrittyCore::new(snapshot.columns, snapshot.rows, 1000);
             if core.restore(&snapshot).is_ok() {
                 cores.insert(*pane, core);
             }

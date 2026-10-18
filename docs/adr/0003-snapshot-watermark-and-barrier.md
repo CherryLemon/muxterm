@@ -47,6 +47,9 @@ initialisation output, and the marker request keeps its place in flight.
 * Cost: one extra round trip at connect time, and one command in flight during the
   snapshot. Pipelining later must preserve the watermark semantics, not merely the
   command order.
-* A snapshot is screen-accurate but not necessarily mode-accurate (bracketed paste,
-  application cursor keys). That limit is documented in
-  `docs/spec/state-sync.md` §5 instead of being hidden.
+* A snapshot is screen-accurate, and mode-accurate only where the server exposes
+  the mode: the per-pane metadata reports the mouse protocol, application cursor
+  keys, the keypad, cursor/insert/origin/wrap and — from tmux 3.7 — bracketed paste,
+  and those are restored. Focus reporting and UTF-8 mouse coordinates are not
+  recoverable. That limit is documented in `docs/spec/state-sync.md` §5 instead of
+  being hidden.

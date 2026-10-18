@@ -31,6 +31,9 @@ echo "== resize =="
 echo "== mouse =="
 \$POC mouse --socket ${SOCKET}
 
+echo "== modes =="
+\$POC modes --socket ${SOCKET}
+
 echo "== reconnect =="
 \$POC reconnect --socket ${SOCKET} --detach-seconds 3
 

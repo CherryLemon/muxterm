@@ -6,6 +6,7 @@
 //! poc stream    --socket <name> [--session poc] [--seconds 5]
 //! poc resize    --socket <name> [--session poc]
 //! poc mouse     --socket <name> [--session poc]
+//! poc modes     --socket <name> [--session poc]
 //! poc reconnect --socket <name> [--session poc] [--detach-seconds 3]
 //! poc leak      --socket <name> [--session poc] [--inject-bug]
 //! ```
@@ -15,6 +16,7 @@
 //! container that server lives and dies with the container.
 
 mod core_gate;
+mod pane_modes;
 mod scenarios;
 mod tmux;
 
@@ -85,7 +87,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(command) = args.first().cloned() else {
         eprintln!(
-            "usage: poc <create|snapshot|stream|resize|mouse|reconnect|leak|core-gate|doctor> [options]"
+            "usage: poc <create|snapshot|stream|resize|mouse|modes|reconnect|leak|core-gate|doctor> [options]"
         );
         return ExitCode::from(2);
     };
@@ -104,6 +106,7 @@ fn main() -> ExitCode {
         "stream" => cmd_stream(&tmux, &options),
         "resize" => cmd_resize(&tmux, &options),
         "mouse" => cmd_mouse(&tmux, &options),
+        "modes" => cmd_modes(&tmux, &options),
         "reconnect" => cmd_reconnect(&tmux, &options),
         "leak" => cmd_leak(&tmux, &options),
         "core-gate" => cmd_core_gate(&tmux, &options),
@@ -264,6 +267,21 @@ fn cmd_mouse(tmux: &Tmux, options: &Options) -> Result<(), String> {
         Ok(())
     } else {
         Err("mouse scenario failed".to_string())
+    }
+}
+
+/// Proves that per-pane application input modes survive a reconnect.
+fn cmd_modes(tmux: &Tmux, options: &Options) -> Result<(), String> {
+    println!(
+        "scenario: pane application modes (session {})",
+        options.session
+    );
+    let report = scenarios::modes(tmux, &options.session)?;
+    let code = report.print();
+    if code == 0 {
+        Ok(())
+    } else {
+        Err("modes scenario failed".to_string())
     }
 }
 

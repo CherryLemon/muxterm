@@ -14,7 +14,9 @@ a reattach, and knowing when the restored state stops being true.
 | screen contents | `capture-pane -p -e -q -N -S -<history> -E -` | `-e` keeps escape sequences, `-N` keeps row geometry, `-J` is deliberately absent (see §5); `history` is bounded by `Limits::max_response_lines - pane_height`, and `-S 0` means the visible screen only |
 | cursor position, alternate screen, history size/limit | `display-message -p -t <pane> '#{cursor_x} …'` | per pane |
 | pane modes (copy mode, …) | `#{pane_in_mode}`, `#{pane_mode}`, `%pane-mode-changed` | |
-| terminal modes that affect input, e.g. bracketed paste, per-pane key reporting | pane application state | **not fully solved**: tracked in §5 |
+| application input modes: mouse protocol, DECCKM, DECKPAM, cursor, insert, origin, wrap | the same metadata query, `#{mouse_*_flag}`, `#{keypad*_flag}`, `#{cursor,insert,origin,wrap}_flag` | applied by the restore; §5 |
+| bracketed paste (DECSET 2004) | `#{bracket_paste_flag}` | reported from tmux 3.7; unknown before, never guessed (§5) |
+| focus reporting (DECSET 1004), UTF-8 mouse coordinates (DECSET 1005) | — | **not recoverable**: no pane format on any release up to 3.8 |
 
 A single `capture-pane` is *not* a terminal state snapshot. The sequence above is a
 deliberate approximation whose limits are stated here rather than hidden.
@@ -123,14 +125,22 @@ model) is not waiting for a full resync: the session runs a small
   re-wrap on resize may not be.  Verified by `poc core-gate`, whose text comparison
   is cell-for-cell against a second `capture-pane` of the same pane.
 
-* **Application modes across a reconnect.** Bracketed paste, application cursor
-  keys, mouse reporting and per-pane key reporting live inside the pane's
-  application; `capture-pane` cannot reproduce them, and tmux only lets a control
-  client submit terminal reports on newer versions. The *encoders* for those
-  inputs exist ([`input.md`](input.md)) and the terminal core exports the modes it
-  observed, but a reconnect must still be documented as *screen-accurate* and not
-  guaranteed *mode-accurate* — an editor may need a nudge (redraw) after a
-  reconnect. This is exactly the class of problem the plan calls out.
+* **Application modes across a reconnect, as far as tmux reports them.** The pane's
+  program — not the client — owns mouse reporting, bracketed paste, application
+  cursor keys and the keypad, and `capture-pane` cannot reproduce any of them. The
+  metadata query therefore asks tmux for the switches it tracks and the restore
+  applies them ([`input.md`](input.md) §4 lists the exact mapping). That makes a
+  reconnect *mode-accurate where the server exposes the mode*, which is a narrower
+  claim than "mode-accurate", and the difference is not a footnote:
+  * `#{bracket_paste_flag}` only exists from tmux 3.7. On an older server the field
+    is empty, the client records **unknown** (`Option::None`) and the restore leaves
+    the emulator default alone instead of guessing — a paste is sent unwrapped,
+    which the application sees as typing;
+  * focus in/out reporting (DECSET 1004) and UTF-8 mouse coordinates (DECSET 1005)
+    have no format on any release up to 3.8, so they are absent from
+    `term_core::InputModes` rather than reported as `false`.
+  A program that relies on either gap can still need a redraw after a reconnect; the
+  client must not claim otherwise.
 * **Mode changes from the server.** `%pane-mode-changed` without a mode name means
   "the mode changed" (tmux 3.4 sends the bare form on enter *and* leave); the model
   toggles it. Versions that send the mode name on enter are handled by the same
@@ -163,6 +173,7 @@ model) is not waiting for a full resync: the session runs a small
 | restore is idempotent (screen and alternate screen) | `crates/term-core/tests/gate.rs::restore_is_idempotent_*` |
 | damage is reported for a repaint | `crates/term-core/tests/gate.rs::damage_*` |
 | mouse reports reach the pane byte-for-byte | `poc mouse` |
+| per-pane application input modes survive a reconnect and reach the encoder | `poc modes` |
 | input still works after restore | `poc reconnect` typed-command check |
 | no control command leaks to the shell | `poc leak`, plus `poc leak --inject-bug` as a falsification test |
 | byte-level parser robustness | `crates/tmux-protocol/tests/boundary.rs` (every split point of every fixture) |

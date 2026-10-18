@@ -57,8 +57,12 @@ reports).
 
 Two things the gate surfaced are recorded as limitations rather than fixed:
 the wrap flag of a joined logical line is not restored, and per-pane application
-modes (bracketed paste, application cursor keys) still cannot be recovered from a
-snapshot.  See `docs/spec/state-sync.md` §5.
+modes cannot be recovered from a *capture* at all.  The second one is now solved
+where tmux exposes the mode: the metadata query reports the mouse protocol,
+DECCKM, DECKPAM, cursor, insert, origin and wrap flags, and (from tmux 3.7)
+bracketed paste, which `ScreenSnapshot::input_modes` carries into the restore.
+Focus reporting and UTF-8 mouse coordinates remain unrecoverable.  See
+`docs/spec/state-sync.md` §5.
 
 ## Consequence
 

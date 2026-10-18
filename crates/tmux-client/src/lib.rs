@@ -24,7 +24,9 @@ pub mod sync;
 pub mod transport;
 
 pub use epoch::ConnectionEpoch;
-pub use model::{Consistency, ModelChange, PaneState, RemoteModel, SessionState, WindowState};
+pub use model::{
+    Consistency, ModelChange, PaneModes, PaneState, RemoteModel, SessionState, WindowState,
+};
 pub use session::{ControlSession, PaneOutputState, SessionError, SessionEvent, MAX_AUTO_RESYNCS};
 pub use sync::{SyncEngine, SyncError, SyncOutcome, SyncStats, Tag, TaggedCommand};
 pub use transport::{

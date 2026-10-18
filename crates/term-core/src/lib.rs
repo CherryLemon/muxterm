@@ -33,7 +33,7 @@ pub use alacritty_core::{AlacrittyCore, CoreListener, SideEffectCounts};
 pub use input::{
     encode_focus, encode_mouse, encode_paste, Modifiers, MouseAction, MouseButton, MouseEvent,
 };
-pub use snapshot::{RestoreError, RestoreReport, ScreenSnapshot};
+pub use snapshot::{InputModes, RestoreError, RestoreReport, ScreenSnapshot};
 pub use view::{CellFlags, CellView, Color, Cursor, CursorShape, LineView, Modes, ScreenView};
 
 /// A span of one viewport row that changed since the last damage report.
