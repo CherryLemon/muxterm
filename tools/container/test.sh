@@ -27,11 +27,11 @@ cargo fmt --all -- --check
 
 if [ "${QUICK}" != "1" ]; then
   echo "== clippy =="
-  cargo clippy --workspace --all-targets -- -D warnings
+  cargo clippy --locked --workspace --all-targets -- -D warnings
 fi
 
 echo "== tests =="
-cargo test --workspace --all-targets
+cargo test --locked --workspace --all-targets
 
 echo "== fixtures =="
 if [ -f crates/tmux-protocol/tests/fixtures/manifest.json ]; then

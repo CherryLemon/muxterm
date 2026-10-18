@@ -1,1 +1,1 @@
-%output %0 q
+%pane-mode-changed %0

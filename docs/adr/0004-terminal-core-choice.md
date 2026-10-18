@@ -32,8 +32,10 @@ under a second.
   `docs/spec/state-sync.md` §5.
 * **Per-pane application modes** (bracketed paste, application cursor keys, mouse
   reporting) live in the remote application and are not derivable from a capture.
-  The core can *report* its own modes, but a reconnect cannot set the pane's.  Same
-  section.
+  The core can *report* its own modes, and `restore` can set them from the metadata
+  tmux exposes (`ScreenSnapshot::input_modes`); what tmux does not report — focus
+  events, UTF-8 mouse coordinates, bracketed paste before tmux 3.7 — stays unknown.
+  Same section.
 * **Erase-display pushes a line into scrollback** in this core, which would add
   phantom history to every restore.  The adapter avoids `CSI 2 J` and clears rows
   individually instead; the reason is recorded in the code next to the call.

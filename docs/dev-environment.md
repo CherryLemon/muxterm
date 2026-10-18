@@ -23,7 +23,12 @@ tools/container/run.sh <cmd>     # any command inside the sandbox
 
 Both give the same practical isolation: only this repository is visible, `/tmp` is
 private, tmux servers and sockets live and die with the run, and no host process
-can be reached or signalled.
+can be signalled.  The network namespace is deliberately **shared** by default
+(`--network host`, and the sandbox runner does not unshare net): the package proxy
+and the crate registry live on the host's loopback.  "No host process can be
+reached" would therefore be too strong; the accurate claim is that no host process
+can be signalled or inspected, and the tmux socket is not reachable because it is
+in the private `/tmp`.
 
 ### Why a docker *volume* and not a bind mount
 
@@ -35,12 +40,14 @@ named volume, runs the command against it, and streams recorded artefacts back:
 ```
 host repo ──tar──▶ muxterm-work volume ──▶ container (private /tmp, own namespaces)
                          │
-                         └──tar──▶ host repo   (only crates/tmux-protocol/tests/fixtures)
+                         └──tar──▶ host repo   (fixtures + Cargo.lock)
 ```
 
 Sources flow one way, so a container run can never clobber an edit made while it
-was executing. A one-off run that really must write more back sets
-`MUXTERM_SYNC_BACK_EXTRA=crates` (used for `cargo fmt`).
+was executing.  `Cargo.lock` is the exception on the way back: cargo regenerates it
+inside the volume and the committed copy must not stay stale.  A one-off run that
+really must write more back sets `MUXTERM_SYNC_BACK_EXTRA=crates` (used for
+`cargo fmt`).
 
 ### Isolation summary
 
@@ -50,6 +57,8 @@ was executing. A one-off run that really must write more back sets
 | `/tmp` is private and dies with the run | `--tmpfs /tmp` / tmpfs mount in the namespace |
 | the tmux socket directory is private | `TMUX_TMPDIR=/tmp/tmux-runtime` inside the run |
 | no host tmux server can be reached | every scenario uses `tmux -L <private-socket>`, and that socket lives in the private `/tmp` |
+| tmux 3.4 is the exercised version | the image builds it into `/opt/tmux/3.4` and puts it first in `PATH`; Debian's 3.3a stays installed as the baseline |
+| network is shared with the host | needed for the package proxy/crate registry; no host process can be signalled |
 | no port is published | no `-p`; networking is used only for the crate registry and the proxy |
 | build artefacts do not fill the workspace | `target/` and the cargo caches live in named volumes |
 | zombies are reaped | `--init` |

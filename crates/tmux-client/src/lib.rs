@@ -5,7 +5,7 @@
 //! | module | responsibility | may talk to the network? |
 //! |---|---|---|
 //! | [`crate::transport`] | spawn and talk to `tmux -C` / `ssh` | yes (that is its job) |
-//! | [`crate::epoch`] | reject events from an abandoned connection | no |
+//! | [`crate::epoch`] | identify one connection attempt | no |
 //! | [`crate::model`] | the remote object model (source of truth) | no |
 //! | [`crate::sync`] | snapshot / resynchronisation sequence | no |
 //! | [`crate::session`] | drives all of the above in stream order | through the transport |
@@ -23,8 +23,12 @@ pub mod session;
 pub mod sync;
 pub mod transport;
 
-pub use epoch::{ConnectionEpoch, EpochFilter};
-pub use model::{Consistency, ModelChange, PaneState, RemoteModel, SessionState, WindowState};
-pub use session::{ControlSession, SessionError, SessionEvent};
+pub use epoch::ConnectionEpoch;
+pub use model::{
+    Consistency, ModelChange, PaneModes, PaneState, RemoteModel, SessionState, WindowState,
+};
+pub use session::{ControlSession, PaneOutputState, SessionError, SessionEvent, MAX_AUTO_RESYNCS};
 pub use sync::{SyncEngine, SyncError, SyncOutcome, SyncStats, Tag, TaggedCommand};
-pub use transport::{shell_quote, ProcessTransport, Target, Transport, TransportError};
+pub use transport::{
+    shell_quote, ProcessTransport, Target, TargetError, Transport, TransportError,
+};

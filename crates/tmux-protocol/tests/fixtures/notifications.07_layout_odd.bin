@@ -1,5 +1,5 @@
 %layout-change @1 27e2,80x24,0,0[80x11,0,0{39x11,0,0,1,40x11,40,0,2},80x12,0,12,3] 27e2,80x24,0,0[80x11,0,0{39x11,0,0,1,40x11,40,0,2},80x12,0,12,3] *
 %layout-change @1 27e2,80x24,0,0[80x11,0,0{39x11,0,0,1,40x11,40,0,2},80x12,0,12,3] 27e2,80x24,0,0[80x11,0,0{39x11,0,0,1,40x11,40,0,2},80x12,0,12,3] *
-%output %2 \015\033[K\015root@muxterm-test:/work# 
-%output %1 \015\033[K\015root@muxterm-test:/work# 
-%output %3 \015\033[K\015root@muxterm-test:/work# 
+%output %3 \015\033[K\015\033M\033[K\015root@p-ef-ch-su04-gpu13-h1-dell-2f-4-cm-231-7-8u-2-13:/work# 
+%output %2 \015\033[K\015\033M\033[K\015root@p-ef-ch-su04-gpu13-h1-dell-2f-4-cm-231-7-8u-2-13:/work# 
+%output %1 \015\033[K\015\033M\033[K\015root@p-ef-ch-su04-gpu13-h1-dell-2f-4-cm-231-7-8u-2-13:/work# 

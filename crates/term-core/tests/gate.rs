@@ -4,7 +4,9 @@
 //! server.  The cross-check against a *real* pane (our grid versus what tmux says
 //! the pane contains) lives in `poc core-gate`, which runs inside the container.
 
-use term_core::{AlacrittyCore, CellFlags, Color, CursorShape, ScreenSnapshot, TerminalCore};
+use term_core::{
+    AlacrittyCore, CellFlags, Color, CursorShape, Damage, ScreenSnapshot, TerminalCore,
+};
 
 fn core(columns: u16, rows: u16) -> AlacrittyCore {
     AlacrittyCore::new(columns, rows, 1000)
@@ -298,4 +300,218 @@ fn live_output_continues_after_a_restore() {
     );
     let cursor = core.cursor();
     assert_eq!((cursor.row, cursor.column), (1, 7));
+}
+
+// ------------------------------------------------- incremental refresh ------
+
+#[test]
+fn damage_after_feed_covers_the_changed_row() {
+    let mut core = core(20, 3);
+    assert_eq!(
+        core.take_damage(),
+        Damage::Full,
+        "a freshly built core must be painted once"
+    );
+
+    core.feed(b"visible");
+    let damage = core.take_damage();
+    match &damage {
+        Damage::Partial(lines) => {
+            assert!(!lines.is_empty(), "feeding a visible line damages it");
+            let row = lines
+                .iter()
+                .find(|line| line.row == 0)
+                .unwrap_or_else(|| panic!("row 0 must be in the report: {lines:?}"));
+            assert!(
+                row.left == 0 && row.right >= 6,
+                "the text span is covered: {row:?}"
+            );
+        }
+        Damage::Full => panic!("a feed on a settled core must be partial: {damage:?}"),
+    }
+
+    assert_eq!(
+        core.take_damage(),
+        Damage::Partial(Vec::new()),
+        "without new input there is nothing to repaint"
+    );
+}
+
+#[test]
+fn a_feed_before_the_first_report_is_reported_as_lines() {
+    let mut core = core(20, 3);
+    core.feed(b"visible");
+
+    match core.take_damage() {
+        Damage::Partial(lines) => {
+            assert!(!lines.is_empty());
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.row == 0 && line.left == 0 && line.right >= 6),
+                "the fed row must be covered: {lines:?}"
+            );
+            assert_eq!(
+                lines.len(),
+                3,
+                "the initial full damage is expressed as one span per row"
+            );
+        }
+        Damage::Full => panic!("a feed before the first report must be line-level"),
+    }
+
+    assert_eq!(core.take_damage(), Damage::Partial(Vec::new()));
+}
+
+#[test]
+fn resize_and_restore_mark_the_screen_fully_damaged() {
+    let mut core = core(20, 3);
+    assert_eq!(core.take_damage(), Damage::Full);
+
+    core.resize(30, 4);
+    assert_eq!(
+        core.take_damage(),
+        Damage::Full,
+        "a resize invalidates the old geometry"
+    );
+
+    core.restore(&snapshot(20, 3, &[b"restored"]))
+        .expect("restore succeeds");
+    assert_eq!(
+        core.take_damage(),
+        Damage::Full,
+        "a restore repaints every cell"
+    );
+}
+
+#[test]
+fn mouse_modes_are_exported_individually() {
+    let mut core = core(20, 3);
+    core.feed(b"\x1b[?1000h\x1b[?1006h");
+
+    let modes = core.modes();
+    assert!(
+        modes.mouse_reporting,
+        "the aggregate flag follows click mode"
+    );
+    assert!(modes.mouse_click);
+    assert!(!modes.mouse_drag);
+    assert!(!modes.mouse_motion);
+    assert!(modes.mouse_sgr);
+    assert!(!modes.mouse_utf8);
+
+    core.feed(b"\x1b[?1003h\x1b[?1005h");
+    let modes = core.modes();
+    assert!(modes.mouse_reporting);
+    assert!(!modes.mouse_click, "mouse reporting modes are exclusive");
+    assert!(modes.mouse_motion);
+    assert!(!modes.mouse_sgr, "mouse encodings are exclusive");
+    assert!(modes.mouse_utf8);
+}
+
+// ------------------------------------------------------- restore idempotency --
+
+#[test]
+fn restore_is_idempotent_across_snapshots() {
+    let mut snap_a = snapshot(
+        24,
+        4,
+        &[
+            b"$ history one",
+            b"$ history two",
+            b"$ history three",
+            b"alpha \x1b[1mbold\x1b[0m",
+            b"bravo",
+            b"charlie",
+            b"$ cursor \x1b[6n",
+        ],
+    );
+    snap_a.cursor = (2, 3);
+    assert_eq!(snap_a.history_lines(), 3);
+
+    let mut fresh = core(24, 4);
+    let report = fresh.restore(&snap_a).expect("restore succeeds");
+    assert!(
+        report.responses_suppressed >= 1,
+        "the repaint's query must be suppressed: {report:?}"
+    );
+    let expected_text = fresh.screen().dump_text();
+    let expected_cursor = fresh.cursor();
+    let expected_modes = fresh.modes();
+    let expected_history = fresh.history_size();
+    assert_eq!(expected_history, 3);
+
+    // Leave the reused core in a completely different state: other geometry,
+    // other content, history, cursor and modes.
+    let mut reused = core(24, 4);
+    reused.feed(b"\x1b[?1h\x1b[?6h\x1b[?1000h\x1b[?1006h");
+    assert!(reused.modes().application_cursor);
+    let mut snap_b = snapshot(
+        30,
+        6,
+        &[
+            b"stale history",
+            b"stale one",
+            b"stale two",
+            b"stale three",
+            b"stale four",
+            b"stale five",
+            b"stale six",
+        ],
+    );
+    snap_b.cursor = (9, 4);
+    reused.restore(&snap_b).expect("restore succeeds");
+    assert_eq!(reused.screen().line_text(0).trim_end(), "stale one");
+
+    let report = reused.restore(&snap_a).expect("restore succeeds");
+    assert!(
+        report.responses_suppressed >= 1,
+        "a restore still suppresses responses: {report:?}"
+    );
+
+    assert_eq!(
+        reused.screen().dump_text(),
+        expected_text,
+        "a second restore must not paint over the previous screen"
+    );
+    assert_eq!(reused.cursor(), expected_cursor);
+    assert_eq!(
+        reused.modes(),
+        expected_modes,
+        "modes must come from the snapshot, not from the old screen"
+    );
+    assert_eq!(reused.history_size(), expected_history);
+}
+
+#[test]
+fn restore_is_idempotent_on_the_alternate_screen() {
+    let mut snap_a = snapshot(20, 3, &[b"alt one", b"alt two", b"alt three"]);
+    snap_a.alternate_on = true;
+    snap_a.cursor = (4, 1);
+
+    let mut fresh = core(20, 3);
+    fresh.restore(&snap_a).expect("restore succeeds");
+    let expected_text = fresh.screen().dump_text();
+    let expected_cursor = fresh.cursor();
+    let expected_modes = fresh.modes();
+    let expected_history = fresh.history_size();
+
+    let mut reused = core(20, 3);
+    reused.feed(b"\x1b[?1h\x1b[?6h");
+    let mut snap_b = snapshot(
+        20,
+        3,
+        &[b"history", b"primary one", b"primary two", b"primary three"],
+    );
+    snap_b.cursor = (5, 2);
+    reused.restore(&snap_b).expect("restore succeeds");
+    assert!(!reused.modes().alternate_screen);
+
+    let report = reused.restore(&snap_a).expect("restore succeeds");
+    assert!(report.alternate_switched);
+    assert!(report.cursor_set);
+    assert_eq!(reused.screen().dump_text(), expected_text);
+    assert_eq!(reused.cursor(), expected_cursor);
+    assert_eq!(reused.modes(), expected_modes);
+    assert_eq!(reused.history_size(), expected_history);
 }

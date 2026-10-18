@@ -177,6 +177,16 @@ pub struct Modes {
     pub application_keypad: bool,
     /// Some mouse reporting mode is active.
     pub mouse_reporting: bool,
+    /// Mouse clicks are reported (DECSET 1000).
+    pub mouse_click: bool,
+    /// Button drags are reported (DECSET 1002).
+    pub mouse_drag: bool,
+    /// All motions are reported (DECSET 1003).
+    pub mouse_motion: bool,
+    /// Mouse reports use the SGR encoding (DECSET 1006).
+    pub mouse_sgr: bool,
+    /// Mouse reports use the UTF-8 coordinate encoding (DECSET 1005).
+    pub mouse_utf8: bool,
     /// The cursor is visible.
     pub show_cursor: bool,
     /// Insert mode.
@@ -199,6 +209,11 @@ impl Modes {
             mouse_reporting: mode.intersects(
                 TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION,
             ),
+            mouse_click: mode.contains(TermMode::MOUSE_REPORT_CLICK),
+            mouse_drag: mode.contains(TermMode::MOUSE_DRAG),
+            mouse_motion: mode.contains(TermMode::MOUSE_MOTION),
+            mouse_sgr: mode.contains(TermMode::SGR_MOUSE),
+            mouse_utf8: mode.contains(TermMode::UTF8_MOUSE),
             show_cursor: mode.contains(TermMode::SHOW_CURSOR),
             insert: mode.contains(TermMode::INSERT),
             origin: mode.contains(TermMode::ORIGIN),
@@ -282,6 +297,11 @@ impl<'a> ScreenView<'a> {
     }
 
     /// The cursor.
+    ///
+    /// The row is relative to the viewport: when the screen is scrolled back, a
+    /// cursor that belongs to the visible region moves down with the text.  When
+    /// the cursor itself is scrolled out of view, `visible` is false and the row
+    /// is clamped to the nearest edge.
     #[must_use]
     pub fn cursor(&self) -> Cursor {
         let content = self.term.renderable_content();
@@ -292,11 +312,26 @@ impl<'a> ScreenView<'a> {
             AnsiCursorShape::HollowBlock => CursorShape::HollowBlock,
             AnsiCursorShape::Hidden => CursorShape::Hidden,
         };
+        let rows = self.rows();
+        let offset = i32::try_from(self.term.grid().display_offset()).unwrap_or(i32::MAX);
+        let viewport_line = content.cursor.point.line.0.saturating_sub(offset);
+        let (row, in_viewport) = if viewport_line < 0 {
+            (0, false)
+        } else {
+            let line = usize::try_from(viewport_line).unwrap_or(usize::MAX);
+            if line < rows {
+                (line, true)
+            } else {
+                (rows.saturating_sub(1), false)
+            }
+        };
         Cursor {
-            row: content.cursor.point.line.0.max(0) as usize,
+            row,
             column: content.cursor.point.column.0,
             shape,
-            visible: content.mode.contains(TermMode::SHOW_CURSOR) && shape != CursorShape::Hidden,
+            visible: in_viewport
+                && content.mode.contains(TermMode::SHOW_CURSOR)
+                && shape != CursorShape::Hidden,
         }
     }
 

@@ -218,6 +218,78 @@ fn layout_strings_from_a_real_server_parse() {
 }
 
 #[test]
+fn a_percent_line_inside_a_recorded_response_is_payload() {
+    // The pane printed `%HELLO`; the following capture-pane returns it as a
+    // response line.  The server guarantees that no notification is emitted
+    // inside a block, so the parser must keep it as data.
+    let Some(bytes) = load("attach_and_commands.12_percent_inside_block.bin") else {
+        return;
+    };
+    let mut parser = Parser::with_default_limits();
+    let mut events = Vec::new();
+    parser.feed(&bytes, &mut events);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::ResponseLine(line) if line == b"%HELLO")),
+        "a %-prefixed response line must stay inside the block: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            Event::Unknown { .. } | Event::PasteBufferChanged { .. }
+        )),
+        "the line is not a notification: {events:?}"
+    );
+}
+
+#[test]
+fn pane_mode_changed_is_recorded_without_a_mode_name() {
+    // tmux 3.4 sends `%pane-mode-changed %0` on both enter and leave; the model
+    // has to toggle rather than interpret the absence of a name as "left".
+    for name in [
+        "notifications.13_enter_copy_mode.bin",
+        "notifications.14_leave_copy_mode.bin",
+    ] {
+        let Some(bytes) = load(name) else {
+            return;
+        };
+        let mut parser = Parser::with_default_limits();
+        let mut events = Vec::new();
+        parser.feed(&bytes, &mut events);
+        let modes: Vec<(tmux_protocol::ids::PaneId, Option<Vec<u8>>)> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::PaneModeChanged { pane, mode } => Some((*pane, mode.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(modes.len(), 1, "{name}: {events:?}");
+        assert_eq!(modes[0].0, tmux_protocol::ids::PaneId::new(0));
+        assert!(modes[0].1.is_none(), "{name}: tmux 3.4 sends the bare form");
+    }
+}
+
+#[test]
+fn a_recorded_response_carries_special_format_values() {
+    let Some(bytes) = load("notifications.12_format_special.bin") else {
+        return;
+    };
+    let mut parser = Parser::with_default_limits();
+    let mut events = Vec::new();
+    parser.feed(&bytes, &mut events);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            Event::ResponseLine(line)
+                if line.windows(6).any(|w| w == b"a b'c\"")
+                    && line.windows(2).any(|w| w == b"%f")
+        )),
+        "the specially named window must survive format expansion: {events:?}"
+    );
+}
+
+#[test]
 fn the_layout_bracket_mapping_matches_the_recorded_orientation() {
     // `notifications.03_split_window` splits with `-h` (side by side) and
     // `notifications.04_split_window_vertical` with `-v` (stacked).  Recorded from

@@ -1,1 +1,1 @@
-%output %0 ^B[
+%pane-mode-changed %0

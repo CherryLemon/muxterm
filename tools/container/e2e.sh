@@ -10,7 +10,7 @@ SOCKET="${1:-poc-e2e}"
 
 SCRIPT=$(cat <<EOS
 set -euo pipefail
-cargo build -p poc-cli
+cargo build --locked -p poc-cli
 POC=./target/debug/poc
 
 echo "== doctor =="
@@ -24,6 +24,15 @@ echo "== snapshot =="
 
 echo "== stream =="
 \$POC stream --socket ${SOCKET} --seconds 3
+
+echo "== resize =="
+\$POC resize --socket ${SOCKET}
+
+echo "== mouse =="
+\$POC mouse --socket ${SOCKET}
+
+echo "== modes =="
+\$POC modes --socket ${SOCKET}
 
 echo "== reconnect =="
 \$POC reconnect --socket ${SOCKET} --detach-seconds 3

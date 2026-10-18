@@ -1,4 +1,4 @@
 %window-renamed @0 sh
 %session-window-changed $0 @1
 %window-add @1
-%output %1 \033[?2004hroot@muxterm-test:/work# 
+%output %1 \033[?2004hroot@p-ef-ch-su04-gpu13-h1-dell-2f-4-cm-231-7-8u-2-13:/work# 

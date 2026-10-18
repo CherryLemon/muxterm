@@ -24,7 +24,7 @@ are not used.
 |---|---|---|
 | tmux | ISC | the system under test; never modified, never vendored |
 | OpenSSH client | BSD-style | SSH transport for remote tmux |
-| python3 | PSF | runs the fixture probe script |
+| python3 | PSF | runs the fixture probe script and the mouse probe used by `poc mouse`; POSIX `sh` runs the application-mode probe used by `poc modes` |
 
 ## Planned but not yet adopted
 

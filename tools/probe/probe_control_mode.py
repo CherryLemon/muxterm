@@ -143,15 +143,25 @@ def probe_attach_and_commands(server: Server) -> dict[str, bytes]:
     command("09_capture_plain", "capture-pane -p -t dev")
     command(
         "10_capture_styled",
-        "capture-pane -p -e -q -J -S -32768 -E - -t dev",
+        # The production command (tmux_client::sync::capture_command): `-N`
+        # keeps row geometry, `-J` is deliberately absent, and the history
+        # bound is applied by the synchroniser.
+        "capture-pane -p -e -q -N -S - -E - -t dev",
     )
     command(
         "11_capture_meta",
         "display-message -p -t dev '#{history_size}/#{history_limit} #{alternate_on} "
         "#{cursor_x},#{cursor_y} #{pane_in_mode} #{pane_mode}'",
     )
-    # 5. an opaque command whose output block contains a '%'-prefixed line
-    command("12_percent_inside_block", "display-message -p '%hello'")
+    # 5. a command response whose body contains a '%'-prefixed line.  The pane
+    # prints one, and the following capture-pane returns it as a response line;
+    # the parser must keep it inside the block instead of mistaking it for a
+    # notification.
+    # Carriage return first: it overwrites the shell prompt so the captured
+    # line really starts with '%'.
+    server.run("send-keys", "-t", "dev", "printf '\\r%%HELLO\\n'", "Enter")
+    time.sleep(0.3)
+    command("12_percent_inside_block", "capture-pane -p -t dev")
 
     proc.stdin.write(b"kill-server\n")
     proc.stdin.flush()
@@ -195,15 +205,19 @@ def probe_notifications(server: Server) -> dict[str, bytes]:
     external("09_kill_window", "kill-window", "-t", "notif:1")
     external("10_kill_session", "kill-session", "-t", "other")
     external("11_window_name_special", "rename-window", "-t", "notif:0", "a b'c\"d\\e%f")
-    external(
-        "12_format_special",
-        "display-message", "-p", "-t", "notif:0",
-        "#{window_id} #{window_name} #{window_layout}",
+    # A command sent through *this* control client, so its response (with the
+    # specially named window from 11) appears in the captured stream.
+    proc.stdin.write(
+        b'display-message -p -t notif:0 "#{window_id} #{window_name} #{window_layout}"\n'
     )
-    # pane mode (copy-mode) is reported differently from ordinary output
-    server.run("send-keys", "-t", "notif:0", "C-b", "[")
+    proc.stdin.flush()
+    out["12_format_special"] = read_burst(fd)
+    # Copy mode is entered by tmux itself, not by sending prefix keys to the
+    # pane's shell (send-keys would deliver those bytes to the application and
+    # produce %output, not %pane-mode-changed).
+    server.run("copy-mode", "-t", "notif:0")
     out["13_enter_copy_mode"] = read_burst(fd)
-    server.run("send-keys", "-t", "notif:0", "q")
+    server.run("send-keys", "-t", "notif:0", "-X", "cancel")
     out["14_leave_copy_mode"] = read_burst(fd)
     out["15_layout_string"] = server.run(
         "display-message", "-p", "-t", "notif:0", "#{window_layout}"
