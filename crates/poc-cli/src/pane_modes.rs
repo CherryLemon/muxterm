@@ -11,10 +11,10 @@ use tmux_client::model::{PaneModes, PaneState};
 
 /// Translates the modes tmux reported into the modes a restore can apply.
 ///
-/// The two version-dependent unknowns are carried as they are: `bracketed_paste` stays
-/// `None` when the server could not report it, so the restore leaves the emulator
-/// default alone.  Focus reporting and UTF-8 mouse coordinates have no tmux flag at
-/// all and are therefore *not* guessed here.
+/// Unknown modes stay unknown.  `bracketed_paste` stays `None` when the server could
+/// not report it (before tmux 3.7), so the restore leaves the emulator default
+/// alone; focus reporting and UTF-8 mouse coordinates have no tmux flag on any
+/// release up to 3.8 and are therefore neither restored nor guessed.
 #[must_use]
 pub(crate) fn input_modes(modes: &PaneModes) -> InputModes {
     InputModes {
