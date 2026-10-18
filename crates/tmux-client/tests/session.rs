@@ -79,7 +79,9 @@ impl FakeTmux {
             }
         }
         if line.starts_with("display-message -p -t") {
-            let block = self.block(&["3 2 0 0 2000 0  0"]);
+            // What tmux 3.4 answers for a pane whose program asked for SGR mouse
+            // reports: bracket_paste_flag is empty because the format is newer.
+            let block = self.block(&["3 2 0 0 2000 0 0 1 0 1 0 1 1 0 1 0 0 1 "]);
             self.send(block);
             return;
         }
@@ -260,6 +262,21 @@ fn snapshot_completes_and_marks_the_model_trustworthy() {
         session.model().sessions()[&session_id].current_window,
         Some(tmux_protocol::ids::WindowId::new(0))
     );
+    // The metadata response is folded into the pane, including the application
+    // modes and the "unknown" bracket-paste flag of an old server.
+    let state = &session.model().panes()[&pane];
+    let modes = state
+        .modes
+        .expect("the metadata response carries the modes");
+    assert!(modes.mouse_drag && modes.mouse_sgr, "{modes:?}");
+    assert!(!modes.mouse_click && !modes.mouse_motion, "{modes:?}");
+    assert!(modes.application_cursor && modes.show_cursor, "{modes:?}");
+    assert!(
+        modes.line_wrap && !modes.insert && !modes.origin,
+        "{modes:?}"
+    );
+    assert_eq!(modes.bracketed_paste, None);
+    assert_eq!(state.cursor, (3, 2));
 }
 
 #[test]
